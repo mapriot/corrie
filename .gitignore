@@ -1,0 +1,8 @@
+/target
+/.claude
+*.tif
+*.tiff
+*.vrt
+*.pmtiles
+*.mbtiles
+/docs/benchmark/out
