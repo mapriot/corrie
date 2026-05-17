@@ -230,8 +230,83 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn run_tile(_args: TileArgs) -> anyhow::Result<()> {
-    anyhow::bail!("`corrie tile` not yet implemented (see Task 31)")
+fn run_tile(args: TileArgs) -> anyhow::Result<()> {
+    use std::path::PathBuf;
+    use anyhow::Context;
+    use corrie::config::{parse, parse_and_resolve};
+    use corrie::ingest;
+    use corrie::feature_store::{Reader, cache_valid};
+    use corrie::spatial_index::load_rtree;
+    use corrie::tile_gen::{enumerate_tiles, hilbert_sort, process_tile};
+    use corrie::container::pmtiles::PmtilesWriter;
+
+    if let Some(w) = args.workers {
+        rayon::ThreadPoolBuilder::new().num_threads(w).build_global()
+            .context("rayon")?;
+    }
+
+    let cfg = parse(&args.config)?;
+    let sources = parse_and_resolve(&args.config)?;
+
+    let cache_dir = match args.cache_dir {
+        Some(p) => p,
+        None => args.config.parent().unwrap_or_else(|| std::path::Path::new(".")).join(".corrie-cache"),
+    };
+
+    let shp_paths: Vec<PathBuf> = sources.iter().map(|s| s.shp_path.clone()).collect();
+    let needs_ingest = args.rebuild_cache || !cache_valid(&cache_dir, &shp_paths);
+    if needs_ingest {
+        eprintln!("Ingesting {} SHPs into {:?} ...", shp_paths.len(), cache_dir);
+        let t0 = std::time::Instant::now();
+        let stats = ingest::run(&sources, &cache_dir)?;
+        eprintln!("Ingested {} features ({} vertices) in {:.2}s",
+            stats.features, stats.vertices, t0.elapsed().as_secs_f64());
+    } else {
+        eprintln!("Using cached feature store in {:?}", cache_dir);
+    }
+
+    let reader = Reader::open(&cache_dir)?;
+    let rtree = load_rtree(&cache_dir)?;
+
+    // Output layer name: assume single output layer (all SHPs write_to the same target).
+    // For mapriot's config this is always "contour".
+    let output_layer = sources.first()
+        .map(|s| s.output_layer_name.clone())
+        .unwrap_or_else(|| "contour".to_string());
+
+    // Enumerate tiles.
+    let mut tiles = enumerate_tiles(cfg.settings.bounding_box, cfg.settings.minzoom, cfg.settings.maxzoom);
+    eprintln!("{} tiles to process", tiles.len());
+    hilbert_sort(&mut tiles);
+
+    // PMTiles writer.
+    let (w, s, e, n) = (
+        cfg.settings.bounding_box[0], cfg.settings.bounding_box[1],
+        cfg.settings.bounding_box[2], cfg.settings.bounding_box[3]
+    );
+    let mut writer = PmtilesWriter::create(
+        &args.output, cfg.settings.minzoom, cfg.settings.maxzoom,
+        (w, s, e, n), &output_layer, "elevation",
+    )?;
+
+    // Sequential write for now; parallelise in next task.
+    let pb = indicatif::ProgressBar::new(tiles.len() as u64);
+    pb.set_style(indicatif::ProgressStyle::with_template(
+        "[{elapsed_precise}] {bar:45.cyan/blue} {pos:>6}/{len} tiles {per_sec} eta {eta}"
+    ).unwrap());
+
+    let mut written = 0u64;
+    for t in &tiles {
+        if let Some(blob) = process_tile(*t, &reader, &rtree, &sources, &output_layer, "elevation") {
+            writer.add_tile(t.z, t.x, t.y, &blob)?;
+            written += 1;
+        }
+        pb.inc(1);
+    }
+    pb.finish();
+    eprintln!("Wrote {} non-empty tiles", written);
+    writer.finalize()?;
+    Ok(())
 }
 
 fn run_build(args: BuildArgs) -> anyhow::Result<()> {
