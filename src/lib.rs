@@ -7,5 +7,6 @@ pub mod contour;
 pub mod mercator;
 pub mod mvt;
 pub mod raster;
+pub mod shapefile_read;
 pub mod simplify;
 pub mod tile;
