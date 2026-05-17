@@ -60,3 +60,51 @@ pub fn clip_segment_to_box(
         }
     }
 }
+
+/// Clip a polyline to `b`, returning zero or more sub-polylines.
+/// Maintains line continuity: consecutive segments that share an inside endpoint
+/// keep that vertex in one sub-polyline.
+pub fn clip_polyline_to_box(coords: &[[f64; 2]], box_: &Box2) -> Vec<Vec<[f64; 2]>> {
+    if coords.len() < 2 { return Vec::new(); }
+    let mut subs: Vec<Vec<[f64; 2]>> = Vec::new();
+    let mut current: Vec<[f64; 2]> = Vec::new();
+
+    let push_pt = |v: &mut Vec<[f64; 2]>, p: [f64; 2]| {
+        if let Some(&last) = v.last() {
+            if last == p { return; }
+        }
+        v.push(p);
+    };
+
+    for w in coords.windows(2) {
+        let (a, b) = ((w[0][0], w[0][1]), (w[1][0], w[1][1]));
+        match clip_segment_to_box(a, b, box_) {
+            None => {
+                if !current.is_empty() {
+                    if current.len() >= 2 { subs.push(std::mem::take(&mut current)); }
+                    current.clear();
+                }
+            }
+            Some((ca, cb)) => {
+                let ca_equals_a = (ca.0 - a.0).abs() < 1e-12 && (ca.1 - a.1).abs() < 1e-12;
+                if !ca_equals_a {
+                    // Segment was clipped at its start — previous sub ends here.
+                    if current.len() >= 2 { subs.push(std::mem::take(&mut current)); }
+                    current.clear();
+                    push_pt(&mut current, [ca.0, ca.1]);
+                } else if current.is_empty() {
+                    push_pt(&mut current, [ca.0, ca.1]);
+                }
+                push_pt(&mut current, [cb.0, cb.1]);
+                let cb_equals_b = (cb.0 - b.0).abs() < 1e-12 && (cb.1 - b.1).abs() < 1e-12;
+                if !cb_equals_b {
+                    // Segment was clipped at its end — close out this sub.
+                    if current.len() >= 2 { subs.push(std::mem::take(&mut current)); }
+                    current.clear();
+                }
+            }
+        }
+    }
+    if current.len() >= 2 { subs.push(current); }
+    subs
+}
