@@ -75,7 +75,7 @@ pub fn hilbert_sort(tiles: &mut [TileCoord]) {
     });
 }
 
-use crate::clip::{clip_polyline_to_box, Box2};
+use crate::clip::{clip_polyline_to_box, clip_segment_to_box, Box2};
 use crate::config::SourceLayer;
 use crate::feature_store::{FeatureRecord, Reader};
 use crate::mercator::extend_box;
@@ -104,13 +104,16 @@ pub fn process_tile(
 
     let (emnx, emny, emxx, emxy) = extend_box(min_lon, min_latp, max_lon, max_latp);
     let extend = Box2 { min_x: emnx, min_y: emny, max_x: emxx, max_y: emxy };
+    let clip = Box2 { min_x: min_lon, min_y: min_latp, max_x: max_lon, max_y: max_latp };
 
     // Quantization scales.
     let xscale = (max_lon - min_lon) / EXTENT as f64;
     let yscale = (max_latp - min_latp) / EXTENT as f64;
 
-    // R-tree query.
-    let query = AABB::from_corners([emnx as f32, emny as f32], [emxx as f32, emxy as f32]);
+    // R-tree query: use the exact tile clip box so only features whose bbox
+    // intersects the actual tile are included. The extend box is kept for the
+    // geometry clip below (visual continuity across tile edges).
+    let query = AABB::from_corners([min_lon as f32, min_latp as f32], [max_lon as f32, max_latp as f32]);
     let hits: Vec<&FeatureBbox> = query_rtree(rtree, query);
     if hits.is_empty() { return None; }
 
@@ -151,6 +154,15 @@ pub fn process_tile(
         // Clip → multi-segments inside extend box.
         let subs = clip_polyline_to_box(coords, &extend);
         for sub in subs {
+            // Drop sub-polylines that are entirely in the extend zone and never
+            // cross the exact tile box — they carry no visual content for this tile.
+            let crosses_tile = sub.windows(2).any(|w| {
+                clip_segment_to_box((w[0][0], w[0][1]), (w[1][0], w[1][1]), &clip).is_some()
+            });
+            if !crosses_tile {
+                continue; // entirely in the extend zone, not the actual tile
+            }
+
             // Simplify in (lon, latp) degp space.
             let simplified = if eps > 0.0 {
                 let pts: Vec<(f64, f64)> = sub.iter().map(|p| (p[0], p[1])).collect();
