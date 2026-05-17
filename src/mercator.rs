@@ -41,3 +41,14 @@ pub fn tiley2latp(y: u32, z: u8) -> f64 {
     let n = (1u64 << z) as f64;
     latp_max - 2.0 * latp_max * (y as f64 / n)
 }
+
+/// Metres of ground distance → degrees of longitude (= degrees of latp at this row).
+///
+/// Tilemaker uses `RadiusMeter = 6_371_000` (sphere mean radius), and applies
+/// the latitude `cos` correction so the same metric scale survives Mercator
+/// stretching near the poles.
+#[inline]
+pub fn meter2degp(meters: f64, latp_deg: f64) -> f64 {
+    let lat = latp2lat(latp_deg);
+    (180.0 / PI) * (meters / RADIUS_M) / (lat * PI / 180.0).cos()
+}

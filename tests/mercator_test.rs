@@ -1,4 +1,4 @@
-use corrie::mercator::{lat2latp, latp2lat, tilex2lon, tiley2latp};
+use corrie::mercator::{lat2latp, latp2lat, tilex2lon, tiley2latp, meter2degp};
 
 #[test]
 fn lat2latp_round_trip() {
@@ -42,4 +42,22 @@ fn tiley2latp_north_to_south() {
     assert!(max_latp > 0.0);
     assert!(min_latp < 0.0);
     assert!((max_latp + min_latp).abs() < 1e-9, "should be symmetric about latp=0");
+}
+
+#[test]
+fn meter2degp_at_equator() {
+    // At latp=0 (lat=0), 1 metre of longitude ≈ 360/(2πR) degrees
+    let one_m_in_deg = 360.0 / (2.0 * std::f64::consts::PI * 6_371_000.0);
+    let computed = meter2degp(1.0, 0.0);
+    assert!((computed - one_m_in_deg).abs() < 1e-12);
+}
+
+#[test]
+fn meter2degp_at_45_north() {
+    // At lat=45 the degree-per-metre factor is multiplied by 1/cos(45) = √2.
+    let latp45 = lat2latp(45.0);
+    let base = 360.0 / (2.0 * std::f64::consts::PI * 6_371_000.0);
+    let expected = base / (45.0f64.to_radians()).cos();
+    let got = meter2degp(1.0, latp45);
+    assert!((got - expected).abs() < 1e-12);
 }
