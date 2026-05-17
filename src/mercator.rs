@@ -52,3 +52,25 @@ pub fn meter2degp(meters: f64, latp_deg: f64) -> f64 {
     let lat = latp2lat(latp_deg);
     (180.0 / PI) * (meters / RADIUS_M) / (lat * PI / 180.0).cos()
 }
+
+/// The asymmetric clip box tilemaker uses around a tile to maintain cross-tile
+/// line continuity. Matches `coordinates_geom.cpp:95-99` exactly.
+///
+/// Returns `(min_lon, min_latp, max_lon, max_latp)` extended.
+#[inline]
+pub fn extend_box(
+    min_lon: f64,
+    min_latp: f64,
+    max_lon: f64,
+    max_latp: f64,
+) -> (f64, f64, f64, f64) {
+    let w = max_lon - min_lon;
+    let h = max_latp - min_latp;
+    let near = 8191.0 / 8192.0;
+    (
+        min_lon  - w * 2.0,
+        min_latp - h * near,
+        max_lon  + w * near,
+        max_latp + h * 2.0,
+    )
+}

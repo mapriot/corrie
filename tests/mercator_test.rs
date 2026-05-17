@@ -1,4 +1,4 @@
-use corrie::mercator::{lat2latp, latp2lat, tilex2lon, tiley2latp, meter2degp};
+use corrie::mercator::{lat2latp, latp2lat, tilex2lon, tiley2latp, meter2degp, extend_box};
 
 #[test]
 fn lat2latp_round_trip() {
@@ -60,4 +60,18 @@ fn meter2degp_at_45_north() {
     let expected = base / (45.0f64.to_radians()).cos();
     let got = meter2degp(1.0, latp45);
     assert!((got - expected).abs() < 1e-12);
+}
+
+#[test]
+fn extend_box_asymmetry() {
+    // Tile box: min_lon=10, max_lon=11, min_latp=20, max_latp=21
+    let (mnx, mny, mxx, mxy) = extend_box(10.0, 20.0, 11.0, 21.0);
+    // West margin = 2 * width = 2.0 → min_lon - 2.0 = 8.0
+    assert!((mnx - 8.0).abs() < 1e-12);
+    // East margin = (8191/8192) * width ≈ 0.99987..
+    assert!((mxx - (11.0 + 8191.0 / 8192.0)).abs() < 1e-12);
+    // South margin = (8191/8192) * height
+    assert!((mny - (20.0 - 8191.0 / 8192.0)).abs() < 1e-12);
+    // North margin = 2 * height = 2.0
+    assert!((mxy - 23.0).abs() < 1e-12);
 }
