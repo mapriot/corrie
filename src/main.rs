@@ -295,13 +295,25 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
         "[{elapsed_precise}] {bar:45.cyan/blue} {pos:>6}/{len} tiles {per_sec} eta {eta}"
     ).unwrap());
 
+    const CHUNK: usize = 4096;
+
     let mut written = 0u64;
-    for t in &tiles {
-        if let Some(blob) = process_tile(*t, &reader, &rtree, &sources, &output_layer, "elevation") {
-            writer.add_tile(t.z, t.x, t.y, &blob)?;
-            written += 1;
+    for chunk in tiles.chunks(CHUNK) {
+        let results: Vec<Option<Vec<u8>>> = chunk
+            .par_iter()
+            .map(|&t| {
+                let r = process_tile(t, &reader, &rtree, &sources, &output_layer, "elevation");
+                pb.inc(1);
+                r
+            })
+            .collect();
+        for (i, blob_opt) in results.into_iter().enumerate() {
+            if let Some(blob) = blob_opt {
+                let t = chunk[i];
+                writer.add_tile(t.z, t.x, t.y, &blob)?;
+                written += 1;
+            }
         }
-        pb.inc(1);
     }
     pb.finish();
     eprintln!("Wrote {} non-empty tiles", written);
