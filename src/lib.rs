@@ -4,6 +4,7 @@ pub mod attribute_rules;
 pub mod config;
 pub mod container;
 pub mod contour;
+pub mod feature_store;
 pub mod mercator;
 pub mod mvt;
 pub mod raster;
