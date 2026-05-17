@@ -84,7 +84,8 @@ use crate::simplify::simplify;
 use crate::spatial_index::{query_rtree, FeatureBbox};
 use rstar::{RTree, AABB};
 
-/// Per-tile output: gzip-compressed MVT bytes, or None if empty.
+/// Per-tile output: raw MVT bytes (uncompressed), or None if empty.
+/// The pmtiles writer applies gzip compression automatically for MVT tiles.
 pub fn process_tile(
     tile: TileCoord,
     reader: &Reader,
@@ -197,16 +198,7 @@ pub fn process_tile(
     if features_out.is_empty() { return None; }
 
     let mvt = encode_tile(&features_out, output_layer_name, elevation_attr);
-    Some(gzip_compress(&mvt))
-}
-
-fn gzip_compress(data: &[u8]) -> Vec<u8> {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-    let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
-    enc.write_all(data).expect("gzip write");
-    enc.finish().expect("gzip finish")
+    Some(mvt) // raw MVT — pmtiles writer compresses
 }
 
 // Suppress unused-import warning if lat2latp isn't used yet.
