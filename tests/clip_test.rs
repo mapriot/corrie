@@ -1,4 +1,4 @@
-use corrie::clip::{clip_segment_to_box, clip_polyline_to_box, Box2};
+use corrie::clip::{build_clip_chains, clip_segment_to_box, clip_polyline_to_box, Box2};
 
 const B: Box2 = Box2 { min_x: 0.0, min_y: 0.0, max_x: 10.0, max_y: 10.0 };
 
@@ -57,4 +57,42 @@ fn polyline_outside_yields_no_subs() {
     let pl: Vec<[f64; 2]> = vec![[-5.0, -5.0], [-10.0, -10.0]];
     let subs = clip_polyline_to_box(&pl, &B);
     assert!(subs.is_empty());
+}
+
+// --- build_clip_chains tests ---
+
+#[test]
+fn chains_split_at_clip_boundaries() {
+    // Polyline enters, leaves, re-enters the box.
+    let pl: Vec<[f64; 2]> = vec![
+        [-5.0,  5.0],  // outside left
+        [ 3.0,  5.0],  // inside (segment [-5,5]->[3,5] crosses left edge)
+        [ 5.0,  5.0],  // inside
+        [15.0,  5.0],  // outside right (segment crosses right edge)
+        [25.0,  5.0],  // outside right (both endpoints share RIGHT bit -> no intersection)
+        [ 5.0,  8.0],  // inside (segment [25,5]->[5,8] crosses right edge)
+    ];
+    let chains = build_clip_chains(&pl, &B);
+    // Chain 1: [-5,5],[3,5],[5,5],[15,5]
+    // Chain 2: [25,5],[5,8]
+    assert!(!chains.is_empty());
+    for c in &chains { assert!(c.len() >= 2); }
+}
+
+#[test]
+fn chains_drop_polylines_entirely_outside() {
+    let pl: Vec<[f64; 2]> = vec![[-5.0, -5.0], [-10.0, -10.0]];
+    let chains = build_clip_chains(&pl, &B);
+    assert!(chains.is_empty());
+}
+
+#[test]
+fn chains_keep_polylines_entirely_inside() {
+    let pl: Vec<[f64; 2]> = vec![[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]];
+    let chains = build_clip_chains(&pl, &B);
+    assert_eq!(chains.len(), 1);
+    assert_eq!(chains[0].len(), 3);
+    // Vertices are original (unclipped).
+    assert_eq!(chains[0][0], [1.0, 1.0]);
+    assert_eq!(chains[0][2], [3.0, 3.0]);
 }

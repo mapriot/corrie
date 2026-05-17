@@ -61,6 +61,37 @@ pub fn clip_segment_to_box(
     }
 }
 
+/// Split a polyline into chains based on whether each consecutive segment
+/// intersects `clip_box`. Each chain is a maximal sequence of consecutive
+/// segments that have any intersection with clip_box. Chain vertices are the
+/// ORIGINAL source vertices (no clipping applied), so chains may extend
+/// slightly past the clip box at their endpoints — providing natural rendering
+/// overshoot. Chains with < 2 vertices are dropped.
+pub fn build_clip_chains(coords: &[[f64; 2]], clip_box: &Box2) -> Vec<Vec<[f64; 2]>> {
+    if coords.len() < 2 { return Vec::new(); }
+    let mut chains: Vec<Vec<[f64; 2]>> = Vec::new();
+    let mut current: Vec<[f64; 2]> = Vec::new();
+    for w in coords.windows(2) {
+        let a = [w[0][0], w[0][1]];
+        let b = [w[1][0], w[1][1]];
+        if clip_segment_to_box((a[0], a[1]), (b[0], b[1]), clip_box).is_some() {
+            if current.is_empty() {
+                current.push(a);
+            }
+            current.push(b);
+        } else {
+            if current.len() >= 2 {
+                chains.push(std::mem::take(&mut current));
+            }
+            current.clear();
+        }
+    }
+    if current.len() >= 2 {
+        chains.push(current);
+    }
+    chains
+}
+
 /// Clip a polyline to `b`, returning zero or more sub-polylines.
 /// Maintains line continuity: consecutive segments that share an inside endpoint
 /// keep that vertex in one sub-polyline.

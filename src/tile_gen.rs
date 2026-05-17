@@ -75,10 +75,9 @@ pub fn hilbert_sort(tiles: &mut [TileCoord]) {
     });
 }
 
-use crate::clip::{clip_polyline_to_box, clip_segment_to_box, Box2};
+use crate::clip::{build_clip_chains, Box2};
 use crate::config::SourceLayer;
 use crate::feature_store::{FeatureRecord, Reader};
-use crate::mercator::extend_box;
 use crate::mvt::{encode_tile, ContourFeature, EXTENT};
 use crate::simplify::simplify;
 use crate::spatial_index::{query_rtree, FeatureBbox};
@@ -103,8 +102,6 @@ pub fn process_tile(
     let min_latp = tiley2latp(tile.y + 1, z);
     let tile_centre_latp = (min_latp + max_latp) * 0.5;
 
-    let (emnx, emny, emxx, emxy) = extend_box(min_lon, min_latp, max_lon, max_latp);
-    let extend = Box2 { min_x: emnx, min_y: emny, max_x: emxx, max_y: emxy };
     let clip = Box2 { min_x: min_lon, min_y: min_latp, max_x: max_lon, max_y: max_latp };
 
     // Quantization scales.
@@ -112,8 +109,7 @@ pub fn process_tile(
     let yscale = (max_latp - min_latp) / EXTENT as f64;
 
     // R-tree query: use the exact tile clip box so only features whose bbox
-    // intersects the actual tile are included. The extend box is kept for the
-    // geometry clip below (visual continuity across tile edges).
+    // intersects the actual tile are included.
     let query = AABB::from_corners([min_lon as f32, min_latp as f32], [max_lon as f32, max_latp as f32]);
     let hits: Vec<&FeatureBbox> = query_rtree(rtree, query);
     if hits.is_empty() { return None; }
@@ -152,25 +148,17 @@ pub fn process_tile(
 
         let coords = reader.coords_of(rec);
 
-        // Clip → multi-segments inside extend box.
-        let subs = clip_polyline_to_box(coords, &extend);
-        for sub in subs {
-            // Drop sub-polylines that are entirely in the extend zone and never
-            // cross the exact tile box — they carry no visual content for this tile.
-            let crosses_tile = sub.windows(2).any(|w| {
-                clip_segment_to_box((w[0][0], w[0][1]), (w[1][0], w[1][1]), &clip).is_some()
-            });
-            if !crosses_tile {
-                continue; // entirely in the extend zone, not the actual tile
-            }
-
+        // Split into chains: maximal runs of segments intersecting the clip box.
+        // Chain vertices are original source coordinates (natural overshoot).
+        let chains = build_clip_chains(coords, &clip);
+        for chain in chains {
             // Simplify in (lon, latp) degp space.
             let simplified = if eps > 0.0 {
-                let pts: Vec<(f64, f64)> = sub.iter().map(|p| (p[0], p[1])).collect();
+                let pts: Vec<(f64, f64)> = chain.iter().map(|p| (p[0], p[1])).collect();
                 let r = simplify(&pts, eps);
                 r.into_iter().collect::<Vec<_>>()
             } else {
-                sub.iter().map(|p| (p[0], p[1])).collect()
+                chain.iter().map(|p| (p[0], p[1])).collect()
             };
             if simplified.len() < 2 { continue; }
 
