@@ -74,3 +74,128 @@ pub fn hilbert_sort(tiles: &mut [TileCoord]) {
         TileId::from(PTCoord::new(t.z, t.x, t.y).expect("valid coord")).value()
     });
 }
+
+use crate::clip::{clip_polyline_to_box, Box2};
+use crate::config::SourceLayer;
+use crate::feature_store::{FeatureRecord, Reader};
+use crate::mercator::extend_box;
+use crate::mvt::{encode_tile, ContourFeature, EXTENT};
+use crate::simplify::simplify;
+use crate::spatial_index::{query_rtree, FeatureBbox};
+use rstar::{RTree, AABB};
+
+/// Per-tile output: gzip-compressed MVT bytes, or None if empty.
+pub fn process_tile(
+    tile: TileCoord,
+    reader: &Reader,
+    rtree: &RTree<FeatureBbox>,
+    sources: &[SourceLayer],
+    output_layer_name: &str,
+    elevation_attr: &str,
+) -> Option<Vec<u8>> {
+    let z = tile.z;
+
+    // Tile bounds in (lon, latp).
+    let min_lon  = tilex2lon(tile.x, z);
+    let max_lon  = tilex2lon(tile.x + 1, z);
+    let max_latp = tiley2latp(tile.y, z);
+    let min_latp = tiley2latp(tile.y + 1, z);
+    let tile_centre_latp = (min_latp + max_latp) * 0.5;
+
+    let (emnx, emny, emxx, emxy) = extend_box(min_lon, min_latp, max_lon, max_latp);
+    let extend = Box2 { min_x: emnx, min_y: emny, max_x: emxx, max_y: emxy };
+
+    // Quantization scales.
+    let xscale = (max_lon - min_lon) / EXTENT as f64;
+    let yscale = (max_latp - min_latp) / EXTENT as f64;
+
+    // R-tree query.
+    let query = AABB::from_corners([emnx as f32, emny as f32], [emxx as f32, emxy as f32]);
+    let hits: Vec<&FeatureBbox> = query_rtree(rtree, query);
+    if hits.is_empty() { return None; }
+
+    // Per source-layer eps cache (one per unique simplify config encountered).
+    let mut eps_cache: Vec<Option<f64>> = vec![None; sources.len()];
+
+    let mut features_out: Vec<ContourFeature> = Vec::new();
+    let feature_recs: &[FeatureRecord] = reader.features();
+
+    for fb in hits {
+        let rec = &feature_recs[fb.idx as usize];
+        // Layer-level minzoom/maxzoom gate.
+        // CRITICAL: rec is from mmap of a `packed(4)` struct. Copy fields by value.
+        let rec_layer_id = rec.layer_id;
+        let rec_minzoom = rec.minzoom;
+        let rec_elevation = rec.elevation;
+        let rec_flags = rec.flags;
+
+        let s = &sources[rec_layer_id as usize];
+        if z < s.minzoom || z > s.maxzoom { continue; }
+        // Per-feature minzoom gate.
+        if rec_minzoom > z { continue; }
+
+        // Compute / cache eps.
+        let eps = match eps_cache[rec_layer_id as usize] {
+            Some(v) => v,
+            None => {
+                let v = tile_eps_degp(
+                    z, s.simplify_below, s.simplify_level, s.simplify_length,
+                    s.simplify_ratio, tile_centre_latp);
+                eps_cache[rec_layer_id as usize] = Some(v);
+                v
+            }
+        };
+
+        let coords = reader.coords_of(rec);
+
+        // Clip → multi-segments inside extend box.
+        let subs = clip_polyline_to_box(coords, &extend);
+        for sub in subs {
+            // Simplify in (lon, latp) degp space.
+            let simplified = if eps > 0.0 {
+                let pts: Vec<(f64, f64)> = sub.iter().map(|p| (p[0], p[1])).collect();
+                let r = simplify(&pts, eps);
+                r.into_iter().collect::<Vec<_>>()
+            } else {
+                sub.iter().map(|p| (p[0], p[1])).collect()
+            };
+            if simplified.len() < 2 { continue; }
+
+            // Quantize to MVT extent (px, py), drop consecutive duplicates.
+            let mut points: Vec<(i32, i32)> = Vec::with_capacity(simplified.len());
+            for (lon, latp) in simplified {
+                let px = ((lon - min_lon) / xscale).floor() as i32;
+                let py = ((max_latp - latp) / yscale).floor() as i32;
+                if let Some(&last) = points.last() {
+                    if last == (px, py) { continue; }
+                }
+                points.push((px, py));
+            }
+            if points.len() < 2 { continue; }
+
+            features_out.push(ContourFeature {
+                points,
+                elevation: rec_elevation as i32,
+                main: (rec_flags & 0b01) != 0,
+                show: (rec_flags & 0b10) != 0,
+            });
+        }
+    }
+
+    if features_out.is_empty() { return None; }
+
+    let mvt = encode_tile(&features_out, output_layer_name, elevation_attr);
+    Some(gzip_compress(&mvt))
+}
+
+fn gzip_compress(data: &[u8]) -> Vec<u8> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+    enc.write_all(data).expect("gzip write");
+    enc.finish().expect("gzip finish")
+}
+
+// Suppress unused-import warning if lat2latp isn't used yet.
+const _: fn(f64) -> f64 = lat2latp;
