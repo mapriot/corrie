@@ -64,3 +64,13 @@ pub fn enumerate_tiles(bbox: [f64; 4], zmin: u8, zmax: u8) -> Vec<TileCoord> {
     }
     out
 }
+
+/// In-place Hilbert-curve ordering by `pmtiles::TileId`. PMTiles requires
+/// directory entries to be sorted this way for `clustered=true`.
+pub fn hilbert_sort(tiles: &mut [TileCoord]) {
+    use pmtiles::TileCoord as PTCoord;
+    use pmtiles::TileId;
+    tiles.sort_by_cached_key(|t| {
+        TileId::from(PTCoord::new(t.z, t.x, t.y).expect("valid coord")).value()
+    });
+}

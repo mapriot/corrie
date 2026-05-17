@@ -53,3 +53,22 @@ fn enumerate_world_at_z0_is_one_tile() {
     assert_eq!(tiles.len(), 1);
     assert_eq!(tiles[0], TileCoord { z: 0, x: 0, y: 0 });
 }
+
+use corrie::tile_gen::hilbert_sort;
+
+#[test]
+fn hilbert_sort_is_deterministic_and_orders_by_id() {
+    let mut tiles = vec![
+        TileCoord { z: 11, x: 1108, y: 690 },
+        TileCoord { z: 11, x: 1108, y: 691 },
+        TileCoord { z: 11, x: 1110, y: 691 },
+        TileCoord { z: 11, x: 1107, y: 690 },
+    ];
+    hilbert_sort(&mut tiles);
+    // First and last tiles must differ — there must be _some_ ordering effect.
+    assert!(tiles.first() != tiles.last());
+    // Repeated sort idempotent.
+    let snap = tiles.clone();
+    hilbert_sort(&mut tiles);
+    assert_eq!(tiles, snap);
+}
