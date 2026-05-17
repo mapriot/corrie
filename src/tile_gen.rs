@@ -183,14 +183,7 @@ pub fn process_tile(
         }
     }
 
-    if features_out.is_empty() {
-        // The tile bbox intersected at least one feature, but all chains were
-        // clipped or simplified away.  Emit an empty-tile sentinel (empty Vec)
-        // so the pmtiles writer can deduplicate these tiles via a shared blob
-        // instead of omitting them entirely.  Adjacent empty tiles in Hilbert
-        // order will be RLE-collapsed to a single directory entry.
-        return Some(vec![]);
-    }
+    if features_out.is_empty() { return None; }
 
     let mvt = encode_tile(&features_out, output_layer_name, elevation_attr);
     Some(mvt) // raw MVT — pmtiles writer compresses
