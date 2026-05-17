@@ -149,3 +149,64 @@ impl Reader {
         bytemuck::cast_slice(slice)
     }
 }
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+pub const MANIFEST_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Manifest {
+    pub version: u32,
+    pub feature_count: u64,
+    pub vertex_count: u64,
+    pub layer_names: Vec<String>,
+    pub source_hash: [u8; 32],
+}
+
+/// Compute SHA-256 over a sorted list of (path, size, mtime_nanos) tuples.
+pub fn compute_source_hash(paths: &[PathBuf]) -> Result<[u8; 32]> {
+    let mut tuples: Vec<(String, u64, i128)> = Vec::with_capacity(paths.len());
+    for p in paths {
+        let m = std::fs::metadata(p).with_context(|| format!("stat {:?}", p))?;
+        let mtime = m.modified()
+            .context("mtime")?
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let mtime_nanos = mtime.as_nanos() as i128;
+        tuples.push((p.to_string_lossy().into_owned(), m.len(), mtime_nanos));
+    }
+    tuples.sort();
+    let mut hasher = Sha256::new();
+    for (path, size, mtime) in tuples {
+        hasher.update(path.as_bytes());
+        hasher.update(size.to_le_bytes());
+        hasher.update(mtime.to_le_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
+pub fn write_manifest(dir: &Path, m: &Manifest) -> Result<()> {
+    let path = dir.join("manifest.bin");
+    let bytes = bincode::serialize(m).context("serialize manifest")?;
+    std::fs::write(&path, bytes).with_context(|| format!("write {:?}", path))?;
+    Ok(())
+}
+
+pub fn read_manifest(dir: &Path) -> Result<Manifest> {
+    let path = dir.join("manifest.bin");
+    let bytes = std::fs::read(&path).with_context(|| format!("read {:?}", path))?;
+    let m: Manifest = bincode::deserialize(&bytes).context("deserialize manifest")?;
+    Ok(m)
+}
+
+/// Returns true if the cache in `dir` matches the current SHP set.
+pub fn cache_valid(dir: &Path, current_shps: &[PathBuf]) -> bool {
+    let Ok(m) = read_manifest(dir) else { return false; };
+    if m.version != MANIFEST_VERSION { return false; }
+    let Ok(h) = compute_source_hash(current_shps) else { return false; };
+    h == m.source_hash
+}

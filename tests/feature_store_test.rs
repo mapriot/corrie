@@ -1,4 +1,4 @@
-use corrie::feature_store::{Builder, FeatureRecord, Reader};
+use corrie::feature_store::{Builder, FeatureRecord, Reader, compute_source_hash, write_manifest, read_manifest, Manifest};
 
 #[test]
 fn write_and_count_records() {
@@ -45,4 +45,35 @@ fn round_trip_via_mmap_reader() {
 
     let c0 = r.coords_of(&recs[0]);
     assert_eq!(c0, &[[14.0, 57.0], [14.5, 57.5]]);
+}
+
+#[test]
+fn source_hash_changes_with_mtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.shp");
+    std::fs::write(&a, b"shp-bytes-1").unwrap();
+    let h1 = compute_source_hash(&[a.clone()]).unwrap();
+
+    // Sleep > 1s to ensure mtime resolution catches the change.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(&a, b"shp-bytes-2").unwrap();
+    let h2 = compute_source_hash(&[a]).unwrap();
+    assert_ne!(h1, h2);
+}
+
+#[test]
+fn manifest_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = Manifest {
+        version: 1,
+        feature_count: 42,
+        vertex_count: 100,
+        layer_names: vec!["contour".to_string()],
+        source_hash: [0xab; 32],
+    };
+    write_manifest(dir.path(), &m).unwrap();
+    let back = read_manifest(dir.path()).unwrap();
+    assert_eq!(m.feature_count, back.feature_count);
+    assert_eq!(m.source_hash, back.source_hash);
+    assert_eq!(m.layer_names, back.layer_names);
 }
