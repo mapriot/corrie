@@ -3,6 +3,7 @@
 
 use rstar::{RTree, RTreeObject, AABB};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// One R-tree entry: bbox in (lon, latp) f32 + global feature index.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -41,4 +42,15 @@ pub fn serialize_rtree(tree: &RTree<FeatureBbox>) -> anyhow::Result<Vec<u8>> {
 pub fn deserialize_rtree(bytes: &[u8]) -> anyhow::Result<RTree<FeatureBbox>> {
     let tree: RTree<FeatureBbox> = bincode::deserialize(bytes)?;
     Ok(tree)
+}
+
+pub fn save_rtree(tree: &RTree<FeatureBbox>, dir: &Path) -> anyhow::Result<()> {
+    let bytes = serialize_rtree(tree)?;
+    std::fs::write(dir.join("rtree.bin"), bytes)?;
+    Ok(())
+}
+
+pub fn load_rtree(dir: &Path) -> anyhow::Result<RTree<FeatureBbox>> {
+    let bytes = std::fs::read(dir.join("rtree.bin"))?;
+    deserialize_rtree(&bytes)
 }

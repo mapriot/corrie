@@ -1,4 +1,4 @@
-use corrie::spatial_index::{FeatureBbox, build_rtree, query_rtree};
+use corrie::spatial_index::{FeatureBbox, build_rtree, query_rtree, save_rtree, load_rtree};
 use rstar::AABB;
 
 #[test]
@@ -17,4 +17,19 @@ fn build_and_query() {
 
     let none = query_rtree(&tree, AABB::from_corners([10.0, 10.0], [11.0, 11.0]));
     assert!(none.is_empty());
+}
+
+#[test]
+fn save_and_load_rtree() {
+    let dir = tempfile::tempdir().unwrap();
+    let boxes = vec![
+        FeatureBbox { idx: 0, min: [0.0, 0.0], max: [1.0, 1.0] },
+        FeatureBbox { idx: 1, min: [5.0, 5.0], max: [6.0, 6.0] },
+    ];
+    let tree = build_rtree(boxes);
+    save_rtree(&tree, dir.path()).unwrap();
+    let loaded = load_rtree(dir.path()).unwrap();
+    let hits = query_rtree(&loaded, AABB::from_corners([0.5, 0.5], [0.6, 0.6]));
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].idx, 0);
 }
