@@ -9,7 +9,7 @@ use tempfile::TempDir;
 /// spanning longitude 14.0 .. 14.5 around Prague (lat ~50.0), each line composed
 /// of 10 vertices in a smooth arc.
 pub fn write_tiny_shapefile(dir: &Path) -> PathBuf {
-    use dbase::{FieldName, FieldValue, Record, TableWriterBuilder};
+    use shapefile::dbase::{FieldName, FieldValue, Record, TableWriterBuilder};
     use shapefile::record::polyline::Polyline as ShpPolyline;
     use shapefile::record::Point;
 
