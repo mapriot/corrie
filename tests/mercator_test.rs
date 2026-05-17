@@ -1,4 +1,4 @@
-use corrie::mercator::{lat2latp, latp2lat};
+use corrie::mercator::{lat2latp, latp2lat, tilex2lon, tiley2latp};
 
 #[test]
 fn lat2latp_round_trip() {
@@ -23,4 +23,23 @@ fn lat2latp_clamped_at_poles() {
     let high = lat2latp(89.9);
     let cap  = lat2latp(85.051_129);
     assert!((high - cap).abs() < 1e-6, "should clamp at the WebMercator limit");
+}
+
+#[test]
+fn tilex2lon_boundaries() {
+    // At z=0 there is one tile from x=0 to x=1, covering -180..180.
+    assert!((tilex2lon(0, 0) - (-180.0)).abs() < 1e-12);
+    assert!((tilex2lon(1, 0) -  180.0).abs() < 1e-12);
+    // At z=1, x=0..2; x=1 splits at lon=0.
+    assert!((tilex2lon(1, 1)).abs() < 1e-12);
+}
+
+#[test]
+fn tiley2latp_north_to_south() {
+    // y=0 at top = LAT_LIMIT in latp space. y=2^z at bottom.
+    let max_latp = tiley2latp(0, 0);
+    let min_latp = tiley2latp(1, 0);
+    assert!(max_latp > 0.0);
+    assert!(min_latp < 0.0);
+    assert!((max_latp + min_latp).abs() < 1e-9, "should be symmetric about latp=0");
 }
