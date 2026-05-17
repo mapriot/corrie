@@ -7,16 +7,10 @@ use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use pmtiles::{TileCoord, TileId};
 use rayon::prelude::*;
 
-mod container;
-mod contour;
-mod mvt;
-mod raster;
-mod simplify;
-mod tile;
-
-use container::Writer;
-use raster::{dataset_wgs84_bounds, read_elevation_grid};
-use tile::{lat_to_tile_y_xyz, lon_to_tile_x};
+use corrie::container::Writer;
+use corrie::raster::{dataset_wgs84_bounds, read_elevation_grid};
+use corrie::tile::{lat_to_tile_y_xyz, lon_to_tile_x};
+use corrie::{contour, mvt, simplify};
 
 /// A zoom-level / interval pair parsed from the --levels flag.
 #[derive(Clone, Debug)]
