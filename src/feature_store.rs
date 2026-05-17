@@ -118,3 +118,34 @@ impl Builder {
     pub fn n_features(&self) -> u64 { self.n_features }
     pub fn n_vertices(&self) -> u64 { self.n_vertices }
 }
+
+use memmap2::Mmap;
+
+/// Mmap-backed read-only view of a feature_store directory.
+pub struct Reader {
+    features_mmap: Mmap,
+    coords_mmap:   Mmap,
+}
+
+impl Reader {
+    pub fn open(dir: &Path) -> Result<Self> {
+        let f = File::open(dir.join("features.bin"))
+            .with_context(|| format!("open features.bin in {:?}", dir))?;
+        let c = File::open(dir.join("coords.bin"))
+            .with_context(|| format!("open coords.bin in {:?}", dir))?;
+        let features_mmap = unsafe { Mmap::map(&f)? };
+        let coords_mmap   = unsafe { Mmap::map(&c)? };
+        Ok(Self { features_mmap, coords_mmap })
+    }
+
+    pub fn features(&self) -> &[FeatureRecord] {
+        bytemuck::cast_slice(&self.features_mmap[..])
+    }
+
+    pub fn coords_of(&self, rec: &FeatureRecord) -> &[[f64; 2]] {
+        let start_bytes = rec.coords_offset as usize * 16;
+        let end_bytes   = start_bytes + rec.coords_len as usize * 16;
+        let slice = &self.coords_mmap[start_bytes..end_bytes];
+        bytemuck::cast_slice(slice)
+    }
+}
