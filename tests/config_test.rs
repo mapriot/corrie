@@ -54,3 +54,16 @@ fn write_to_merges_into_target_layer() {
     assert_eq!(sources.len(), 2);
     assert!(sources.iter().all(|s| s.output_layer_name == "contour"));
 }
+
+#[test]
+fn parse_real_mapriot_config_if_present() {
+    let path = std::path::Path::new("/Users/patrikd/projects/mapriot/config-contours.json");
+    if !path.exists() {
+        eprintln!("skipping — mapriot config not at {:?}", path);
+        return;
+    }
+    let sources = parse_and_resolve(path).expect("real config");
+    assert!(sources.len() >= 100, "expected many layers; got {}", sources.len());
+    let all_writes_to_contour = sources.iter().all(|s| s.output_layer_name == "contour");
+    assert!(all_writes_to_contour, "expected every layer to write_to=contour");
+}
