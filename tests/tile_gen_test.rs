@@ -31,3 +31,25 @@ fn eps_from_simplify_length_uses_meter2degp() {
     let expected = corrie::mercator::meter2degp(100.0, 0.0);
     assert!((e - expected).abs() < 1e-15);
 }
+
+use corrie::tile_gen::{enumerate_tiles, TileCoord};
+
+#[test]
+fn enumerate_covers_bbox_at_one_zoom() {
+    // ~Prague area, z=11.
+    let bbox = [14.0, 49.9, 14.6, 50.2];
+    let tiles = enumerate_tiles(bbox, 11, 11);
+    assert!(!tiles.is_empty());
+    for t in &tiles {
+        assert_eq!(t.z, 11);
+    }
+    // At z11 the world is 2048 tiles per side; Prague is around x=1107, y=692.
+    assert!(tiles.iter().any(|t| t.x >= 1100 && t.x <= 1115));
+}
+
+#[test]
+fn enumerate_world_at_z0_is_one_tile() {
+    let tiles = enumerate_tiles([-180.0, -85.0, 180.0, 85.0], 0, 0);
+    assert_eq!(tiles.len(), 1);
+    assert_eq!(tiles[0], TileCoord { z: 0, x: 0, y: 0 });
+}
