@@ -29,3 +29,92 @@ pub struct FeatureRecord {
 }
 
 const _: () = assert!(std::mem::size_of::<FeatureRecord>() == 36);
+
+use anyhow::{Context, Result};
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+
+/// Builds a feature_store directory (`features.bin` + `coords.bin`).
+pub struct Builder {
+    dir: PathBuf,
+    features: BufWriter<File>,
+    coords: BufWriter<File>,
+    n_features: u64,
+    n_vertices: u64,
+}
+
+impl Builder {
+    pub fn create(dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {:?}", dir))?;
+        let f = File::create(dir.join("features.bin"))?;
+        let c = File::create(dir.join("coords.bin"))?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            features: BufWriter::new(f),
+            coords: BufWriter::new(c),
+            n_features: 0,
+            n_vertices: 0,
+        })
+    }
+
+    /// Append a feature. `coords` is the polyline in `(lon, latp)` f64 pairs.
+    pub fn add_feature(
+        &mut self,
+        coords: &[[f64; 2]],
+        elevation: i16,
+        minzoom: u8,
+        flags: u8,
+        layer_id: u16,
+    ) -> Result<()> {
+        let offset_vertices = self.n_vertices;
+        let len_vertices = coords.len() as u32;
+
+        // Write coords first (in case features.bin write fails halfway).
+        let bytes: &[u8] = bytemuck::cast_slice(coords);
+        self.coords.write_all(bytes).context("write coords")?;
+        self.n_vertices += coords.len() as u64;
+
+        // Compute bbox.
+        let (mut mnx, mut mny) = (f64::INFINITY, f64::INFINITY);
+        let (mut mxx, mut mxy) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for c in coords {
+            if c[0] < mnx { mnx = c[0]; }
+            if c[1] < mny { mny = c[1]; }
+            if c[0] > mxx { mxx = c[0]; }
+            if c[1] > mxy { mxy = c[1]; }
+        }
+
+        let rec = FeatureRecord {
+            bbox_min_lon:  mnx as f32,
+            bbox_min_latp: mny as f32,
+            bbox_max_lon:  mxx as f32,
+            bbox_max_latp: mxy as f32,
+            coords_offset: offset_vertices,
+            coords_len:    len_vertices,
+            layer_id,
+            elevation,
+            minzoom,
+            flags,
+            _pad: [0; 2],
+        };
+        let rec_bytes: &[u8] = bytemuck::bytes_of(&rec);
+        self.features.write_all(rec_bytes).context("write feature")?;
+        self.n_features += 1;
+        Ok(())
+    }
+
+    /// Flush and close. Returns the number of features written.
+    pub fn finalize(mut self) -> Result<u64> {
+        self.features.flush()?;
+        self.coords.flush()?;
+        // Drop the BufWriters explicitly to release the fds.
+        drop(self.features);
+        drop(self.coords);
+        Ok(self.n_features)
+    }
+
+    pub fn dir(&self) -> &Path { &self.dir }
+    pub fn n_features(&self) -> u64 { self.n_features }
+    pub fn n_vertices(&self) -> u64 { self.n_vertices }
+}
