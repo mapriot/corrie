@@ -80,3 +80,43 @@ pub struct SourceLayer {
     pub simplify_ratio: f64,
     pub simplify_algorithm: String,
 }
+
+/// Parse a tilemaker config.json file. Unknown fields are silently ignored.
+pub fn parse(path: &Path) -> Result<Config> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {:?}", path))?;
+    let config: Config = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse config {:?}", path))?;
+    Ok(config)
+}
+
+/// Parse + resolve. The returned vector has one entry per source layer with
+/// its `output_layer_name` looked up via `write_to`. Source paths are resolved
+/// relative to the config file's directory.
+pub fn parse_and_resolve(path: &Path) -> Result<Vec<SourceLayer>> {
+    let config = parse(path)?;
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+
+    let mut out = Vec::with_capacity(config.layers.len());
+    for (name, l) in &config.layers {
+        let output_name = l.write_to.clone().unwrap_or_else(|| name.clone());
+        let shp_path: PathBuf = if Path::new(&l.source).is_absolute() {
+            PathBuf::from(&l.source)
+        } else {
+            base_dir.join(&l.source)
+        };
+        out.push(SourceLayer {
+            source_layer_name: name.clone(),
+            output_layer_name: output_name,
+            shp_path,
+            minzoom: l.minzoom,
+            maxzoom: l.maxzoom,
+            source_columns: l.source_columns.clone(),
+            simplify_below: l.simplify_below,
+            simplify_level: l.simplify_level,
+            simplify_length: l.simplify_length,
+            simplify_ratio: l.simplify_ratio,
+            simplify_algorithm: l.simplify_algorithm.clone(),
+        });
+    }
+    Ok(out)
+}
