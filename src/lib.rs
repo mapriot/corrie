@@ -1,5 +1,6 @@
 //! corrie — DEM-to-contour vector tile generator and tilemaker SHP→PMTiles replacement.
 
+pub mod attribute_rules;
 pub mod container;
 pub mod contour;
 pub mod mercator;
