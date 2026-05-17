@@ -1,8 +1,6 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::Parser;
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use pmtiles::{TileCoord, TileId};
 use rayon::prelude::*;
@@ -19,59 +17,61 @@ struct Level {
     interval: i32,
 }
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "corrie",
-    version,
-    about = "Fast DEM-to-contour vector tile generator — converts elevation rasters to PMTiles or MBTiles"
-)]
-struct Args {
+#[derive(clap::Parser, Debug)]
+#[command(name = "corrie", version, about = "DEM → vector contour tile generator")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Cmd {
+    /// (legacy) DEM-direct path: single raster → PMTiles/MBTiles
+    Build(BuildArgs),
+    /// Read tilemaker config.json + SHPs, write clustered PMTiles.
+    Tile(TileArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct BuildArgs {
     /// Input elevation raster — GeoTIFF, VRT, or any GDAL-supported format and CRS.
-    /// For multiple rasters, build a VRT first (gdalbuildvrt).
-    input: PathBuf,
-
-    /// Output file — .pmtiles or .mbtiles (container inferred from extension)
-    output: PathBuf,
-
-    /// Minimum zoom level to generate
+    input: std::path::PathBuf,
+    /// Output file — .pmtiles or .mbtiles
+    output: std::path::PathBuf,
     #[arg(long, default_value = "11")]
     min_z: u8,
-
-    /// Maximum zoom level to generate
     #[arg(long, default_value = "14")]
     max_z: u8,
-
-    /// Zoom:interval pairs, comma-separated. Default: "11:50,12:20,13:10,14:5"
-    /// At each zoom, contours are generated for all intervals whose min_zoom <= zoom.
     #[arg(long, default_value = "11:50,12:20,13:10,14:5")]
     levels: String,
-
-    /// Contours with elevation divisible by this get main=1
     #[arg(long, default_value = "50")]
     main_every: i32,
-
-    /// Contours with elevation divisible by this get show=1
     #[arg(long, default_value = "100")]
     show_every: i32,
-
-    /// MVT layer name
     #[arg(long, default_value = "contour")]
     layer: String,
-
-    /// Attribute name for the elevation value
     #[arg(long, default_value = "elevation")]
     elevation_attr: String,
-
-    /// Override the nodata value from the raster metadata
     #[arg(long, allow_hyphen_values = true)]
     nodata: Option<f32>,
-
-    /// Douglas-Peucker simplification tolerance in MVT coordinate units (extent=4096).
-    /// 0 disables simplification.
     #[arg(long, default_value = "2.0")]
     simplify: f64,
+    #[arg(short = 'j', long)]
+    workers: Option<usize>,
+}
 
-    /// Worker thread count (default: all CPUs)
+#[derive(clap::Args, Debug)]
+struct TileArgs {
+    /// Path to a tilemaker config.json
+    config: std::path::PathBuf,
+    /// Output .pmtiles
+    output: std::path::PathBuf,
+    /// Override cache directory (default: <config_dir>/.corrie-cache)
+    #[arg(long)]
+    cache_dir: Option<std::path::PathBuf>,
+    /// Force re-ingest even if cache appears valid
+    #[arg(long)]
+    rebuild_cache: bool,
     #[arg(short = 'j', long)]
     workers: Option<usize>,
 }
@@ -221,9 +221,20 @@ fn process_tile(
     Ok(Some(tile_data))
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+fn main() -> anyhow::Result<()> {
+    use clap::Parser;
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::Build(a) => run_build(a),
+        Cmd::Tile(a) => run_tile(a),
+    }
+}
 
+fn run_tile(_args: TileArgs) -> anyhow::Result<()> {
+    anyhow::bail!("`corrie tile` not yet implemented (see Task 31)")
+}
+
+fn run_build(args: BuildArgs) -> anyhow::Result<()> {
     if let Some(w) = args.workers {
         rayon::ThreadPoolBuilder::new()
             .num_threads(w)
