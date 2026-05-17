@@ -2,6 +2,7 @@
 
 pub mod container;
 pub mod contour;
+pub mod mercator;
 pub mod mvt;
 pub mod raster;
 pub mod simplify;
