@@ -10,4 +10,5 @@ pub mod mvt;
 pub mod raster;
 pub mod shapefile_read;
 pub mod simplify;
+pub mod spatial_index;
 pub mod tile;
