@@ -6,6 +6,26 @@ use anyhow::{Context, Result};
 use pmtiles::{PmTilesStreamWriter, PmTilesWriter, TileCoord, TileType};
 use xxhash_rust::xxh3::xxh3_64;
 
+/// Pre-compressed representation of an empty tile (gzip of zero bytes).
+///
+/// Tiles that were spatially addressed but contained no surviving features
+/// after clipping/simplification are stored as this constant blob.  Because
+/// the pmtiles crate's `add_tile` skips zero-length payloads, we use
+/// `add_raw_tile` with this pre-compressed sentinel instead.  All callers
+/// pass identical bytes, so the crate's hash-based dedup stores only one
+/// copy; consecutive occurrences in Hilbert order are further collapsed by
+/// the RLE run_length mechanism.
+///
+/// The 23-byte sequence is a DEFLATE "stored block" gzip stream for zero bytes,
+/// matching the format written by `pmtiles convert` (go-pmtiles).  The exact
+/// encoding does not matter for dedup — any constant would work — but using the
+/// same bytes as go-pmtiles makes the output wire-identical for empty tiles.
+const EMPTY_GZIP_TILE: &[u8] = &[
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x02, 0xff, 0x01, 0x00, 0x00, 0xff, 0xff, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
 pub struct PmtilesWriter {
     inner: PmTilesStreamWriter<File>,
     seen_hashes: HashMap<u64, u32>,
@@ -47,10 +67,21 @@ impl PmtilesWriter {
     }
 
     pub fn add_tile(&mut self, z: u8, x: u32, y_xyz: u32, data: &[u8]) -> Result<()> {
-        let h = xxh3_64(data);
-        *self.seen_hashes.entry(h).or_insert(0) += 1;
         let coord = TileCoord::new(z, x, y_xyz).context("TileCoord")?;
-        self.inner.add_tile(coord, data).context("add_tile")
+        if data.is_empty() {
+            // Empty sentinel: the tile was addressed but contained no features.
+            // The pmtiles crate skips zero-length payloads in add_tile, so we
+            // submit the pre-compressed constant directly via add_raw_tile.
+            // All empty tiles share the same hash → stored once; consecutive
+            // occurrences in Hilbert order collapse via the RLE run_length.
+            let h = xxh3_64(EMPTY_GZIP_TILE);
+            *self.seen_hashes.entry(h).or_insert(0) += 1;
+            self.inner.add_raw_tile(coord, EMPTY_GZIP_TILE).context("add_raw_tile (empty)")
+        } else {
+            let h = xxh3_64(data);
+            *self.seen_hashes.entry(h).or_insert(0) += 1;
+            self.inner.add_tile(coord, data).context("add_tile")
+        }
     }
 
     /// Returns (unique_blobs, total_tiles).

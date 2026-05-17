@@ -297,7 +297,12 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
 
     const CHUNK: usize = 4096;
 
+    // Tiles are submitted in Hilbert order (hilbert_sort above).  The pmtiles
+    // writer deduplicates identical blobs by content hash and RLE-collapses
+    // consecutive identical entries automatically (e.g. runs of empty tiles).
     let mut written = 0u64;
+    let mut written_empty = 0u64;
+    let mut prev_tile_id: Option<u64> = None;
     for chunk in tiles.chunks(CHUNK) {
         let results: Vec<Option<Vec<u8>>> = chunk
             .par_iter()
@@ -310,13 +315,24 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
         for (i, blob_opt) in results.into_iter().enumerate() {
             if let Some(blob) = blob_opt {
                 let t = chunk[i];
+                // Sanity-check: Hilbert ordering must be non-decreasing.
+                let tile_id = pmtiles::TileId::from(
+                    pmtiles::TileCoord::new(t.z, t.x, t.y).expect("valid TileCoord")
+                ).value();
+                debug_assert!(
+                    prev_tile_id.map_or(true, |p| tile_id >= p),
+                    "tiles are not in Hilbert order — clustered=true and RLE will be wrong"
+                );
+                prev_tile_id = Some(tile_id);
+
                 writer.add_tile(t.z, t.x, t.y, &blob)?;
-                written += 1;
+                if blob.is_empty() { written_empty += 1; } else { written += 1; }
             }
         }
     }
     pb.finish();
-    eprintln!("Wrote {} non-empty tiles", written);
+    eprintln!("Wrote {} non-empty + {} empty tiles ({} total addressed)",
+        written, written_empty, written + written_empty);
     writer.finalize()?;
     Ok(())
 }
