@@ -1,12 +1,18 @@
 mod common;
 
-use corrie::shapefile_read::read_polylines;
+use corrie::shapefile_read::{read_polylines_streaming, ReadFeature};
+
+fn read_all(path: &std::path::Path, field: &str) -> Vec<ReadFeature> {
+    let mut out = Vec::new();
+    read_polylines_streaming(path, field, |f| { out.push(f); Ok(()) }).expect("read");
+    out
+}
 
 #[test]
 fn read_tiny_fixture() {
     let dir = tempfile::tempdir().unwrap();
     let shp = common::write_tiny_shapefile(dir.path());
-    let features = read_polylines(&shp, "elevation").expect("read");
+    let features = read_all(&shp, "elevation");
     assert_eq!(features.len(), 5);
     let elevations: Vec<i16> = features.iter().map(|f| f.elevation).collect();
     assert_eq!(elevations, vec![100, 150, 200, 250, 300]);
@@ -22,7 +28,7 @@ fn read_tiny_fixture() {
 fn read_features_have_bbox() {
     let dir = tempfile::tempdir().unwrap();
     let shp = common::write_tiny_shapefile(dir.path());
-    let features = read_polylines(&shp, "elevation").expect("read");
+    let features = read_all(&shp, "elevation");
     for f in &features {
         // All vertices should be inside the feature's bbox.
         for c in &f.coords {

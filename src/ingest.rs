@@ -1,14 +1,22 @@
-//! Phase 1 driver: read all SHPs (parallel), apply attribute rules,
+//! Phase 1 driver: stream SHPs (parallel readers), apply attribute rules,
 //! write features.bin + coords.bin + rtree.bin + manifest.bin.
+//!
+//! Memory model: features are never accumulated in RAM. Reader threads parse
+//! one SHP each in parallel and push features over a bounded channel; the
+//! main thread is the sole writer to the on-disk builder. Peak RAM is
+//! bounded by the channel buffer + the R-tree bbox vec (24 B/feature), so
+//! ingest of a 30M-feature planet uses ~1 GB regardless of total vertex
+//! count.
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::sync_channel;
 
 use crate::attribute_rules::derive_attributes;
 use crate::config::SourceLayer;
 use crate::feature_store::{Builder, Manifest, compute_source_hash, write_manifest, MANIFEST_VERSION};
-use crate::shapefile_read::{read_polylines, ReadFeature};
+use crate::shapefile_read::{read_polylines_streaming, ReadFeature};
 use crate::spatial_index::{build_rtree, save_rtree, FeatureBbox};
 
 pub struct IngestStats {
@@ -16,7 +24,13 @@ pub struct IngestStats {
     pub vertices: u64,
 }
 
-/// Read all SHPs in parallel, then sequentially write the feature store.
+/// Per-feature payload sent over the reader→writer channel.
+struct StreamItem {
+    layer_id: u16,
+    feature: ReadFeature,
+}
+
+/// Stream all SHPs in parallel, write the feature store on a single writer.
 pub fn run(
     sources: &[SourceLayer],
     cache_dir: &Path,
@@ -34,35 +48,59 @@ pub fn run(
         })
         .collect();
 
-    // Read SHPs in parallel. Each thread accumulates its own Vec<(u16 layer_id, ReadFeature)>.
-    let per_thread: Vec<Result<Vec<(u16, ReadFeature)>>> = parallel_inputs
-        .par_iter()
-        .map(|(lid, s, col)| -> Result<_> {
-            let feats = read_polylines(&s.shp_path, col)
-                .with_context(|| format!("read {:?}", s.shp_path))?;
-            Ok(feats.into_iter().map(|f| (*lid, f)).collect())
-        })
-        .collect();
+    // Bounded channel — backpressures readers when the writer is slow. 4096
+    // slots is a few MB of features in flight; tuned for SSD write throughput.
+    let (tx, rx) = sync_channel::<StreamItem>(4096);
 
-    // Surface first error; flatten ok.
-    let mut all_features: Vec<(u16, ReadFeature)> = Vec::new();
-    for r in per_thread {
-        all_features.extend(r?);
-    }
-
-    // Write feature store sequentially (Builder is not parallel-safe).
     let mut builder = Builder::create(cache_dir)?;
-    let mut bbox_entries: Vec<FeatureBbox> = Vec::with_capacity(all_features.len());
+    let mut bbox_entries: Vec<FeatureBbox> = Vec::new();
+    let mut idx: u32 = 0;
 
-    for (idx, (layer_id, f)) in all_features.iter().enumerate() {
-        let (minzoom, flags) = derive_attributes(f.elevation as i32);
-        builder.add_feature(&f.coords, f.elevation, minzoom, flags, *layer_id)?;
-        bbox_entries.push(FeatureBbox {
-            idx: idx as u32,
-            min: [f.bbox_min_lon as f32, f.bbox_min_latp as f32],
-            max: [f.bbox_max_lon as f32, f.bbox_max_latp as f32],
+    // `std::thread::scope` lets the reader thread borrow `parallel_inputs`
+    // without 'static, and guarantees it joins before we exit the scope.
+    let read_result: Result<()> = std::thread::scope(|scope| {
+        // Spawn one reader-coordinator thread; inside it, rayon parallelises
+        // across SHPs. Each emit sends one feature through the bounded channel.
+        let inputs_ref = &parallel_inputs;
+        let read_handle = scope.spawn(move || -> Result<()> {
+            inputs_ref.par_iter().try_for_each(|(lid, s, col)| -> Result<()> {
+                let lid = *lid;
+                let tx = tx.clone();
+                read_polylines_streaming(&s.shp_path, col, |feature| {
+                    tx.send(StreamItem { layer_id: lid, feature })
+                        .map_err(|_| anyhow::anyhow!("writer thread terminated"))
+                }).with_context(|| format!("read {:?}", s.shp_path))?;
+                Ok(())
+            })?;
+            // Drop the last `tx` clone here so the channel closes when all
+            // readers are done.
+            drop(tx);
+            Ok(())
         });
-    }
+
+        // Main thread is the writer. Drain the channel one feature at a time;
+        // append to coords.bin + features.bin and collect bbox entries for
+        // the R-tree.
+        while let Ok(item) = rx.recv() {
+            let f = item.feature;
+            let (minzoom, flags) = derive_attributes(f.elevation as i32);
+            builder.add_feature(&f.coords, f.elevation, minzoom, flags, item.layer_id)?;
+            bbox_entries.push(FeatureBbox {
+                idx,
+                min: [f.bbox_min_lon as f32, f.bbox_min_latp as f32],
+                max: [f.bbox_max_lon as f32, f.bbox_max_latp as f32],
+            });
+            idx = idx.checked_add(1).context("feature count exceeds u32::MAX")?;
+        }
+
+        // Surface any error from the reader pool (also catches the case where
+        // the writer terminated early and readers got a SendError).
+        match read_handle.join() {
+            Ok(r) => r,
+            Err(_) => anyhow::bail!("reader thread panicked"),
+        }
+    });
+    read_result?;
 
     let n_features = builder.n_features();
     let n_vertices = builder.n_vertices();
