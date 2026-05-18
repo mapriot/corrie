@@ -267,6 +267,9 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
             let td = tempfile::Builder::new().prefix("corrie-cache-").tempdir()
                 .context("create temp cache dir")?;
             let path = td.path().to_path_buf();
+            // Log the path so the user can manually rm -rf after a forced
+            // kill — TempDir's Drop impl doesn't run on SIGKILL / OOM.
+            eprintln!("Temp cache: {}", path.display());
             _temp_cache = Some(td);
             (path, false)
         }
