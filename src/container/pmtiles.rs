@@ -407,9 +407,76 @@ impl PmtilesWriter {
         })
     }
 
-    /// To be implemented in Task 6.
-    pub fn add_tile(&mut self, _z: u8, _x: u32, _y: u32, _mvt_raw: &[u8]) -> anyhow::Result<()> {
-        anyhow::bail!("add_tile not yet implemented — Task 6")
+    pub fn add_tile(&mut self, z: u8, x: u32, y: u32, mvt_raw: &[u8]) -> anyhow::Result<()> {
+        let id = tile_id(z, x, y);
+        if let Some(prev) = self.last_tile_id {
+            if id <= prev {
+                anyhow::bail!(
+                    "tile_id must be strictly monotonic: got {id} after {prev} (z={z}, x={x}, y={y})"
+                );
+            }
+        }
+        self.last_tile_id = Some(id);
+
+        let gz = gzip(mvt_raw).context("gzip tile MVT")?;
+        let offset_in_section = self.next_tile_offset - self.tile_data_section_start;
+
+        // Seek to the absolute tile-data position before writing.
+        self.file.seek(SeekFrom::Start(self.next_tile_offset))
+            .context("seek to next tile offset")?;
+        self.file.write_all(&gz).context("write tile bytes")?;
+        self.next_tile_offset += gz.len() as u64;
+
+        self.leaf_buffer.push(DirEntry {
+            tile_id: id,
+            run_length: 1,
+            offset: offset_in_section,
+            length: gz.len() as u32,
+        });
+        self.total_addressed += 1;
+
+        if self.leaf_buffer.len() >= self.leaf_size {
+            self.flush_leaf()?;
+        }
+        Ok(())
+    }
+
+    fn flush_leaf(&mut self) -> anyhow::Result<()> {
+        if self.leaf_buffer.is_empty() { return Ok(()); }
+
+        // Serialize and gzip the leaf.
+        let raw = serialize_directory(&self.leaf_buffer);
+        let gz = gzip(&raw).context("gzip leaf directory")?;
+
+        // Check the reservation has room.
+        if self.leaves_cursor + gz.len() as u64 > self.leaves_reserved_end {
+            anyhow::bail!(
+                "leaves reservation exhausted at {} / {} bytes — \
+                 increase tile_count_estimate or leaf_size",
+                self.leaves_cursor - self.leaves_reserved_start,
+                self.leaves_reserved_end - self.leaves_reserved_start,
+            );
+        }
+
+        // Write the leaf into the reservation at the current cursor.
+        self.file.seek(SeekFrom::Start(self.leaves_cursor))
+            .context("seek to leaf position")?;
+        self.file.write_all(&gz).context("write leaf bytes")?;
+
+        // Record a root entry pointing to this leaf. Per spec, root entries
+        // pointing at leaves use run_length=0 and (offset, length) into the
+        // leaf directories section (relative).
+        let leaf_offset_relative = self.leaves_cursor - self.leaves_reserved_start;
+        self.root_entries.push(DirEntry {
+            tile_id: self.leaf_buffer[0].tile_id,
+            run_length: 0,
+            offset: leaf_offset_relative,
+            length: gz.len() as u32,
+        });
+
+        self.leaves_cursor += gz.len() as u64;
+        self.leaf_buffer.clear();
+        Ok(())
     }
 
     /// To be implemented in Task 7.
@@ -691,5 +758,83 @@ mod tests {
         drop(w);
         let meta = std::fs::metadata(&path).unwrap();
         assert_eq!(meta.len(), 127 + 4*1024*1024 + 128*1024 + 20_000);
+    }
+
+    #[test]
+    fn add_tile_writes_bytes_and_tracks_offsets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.pmtiles");
+        let mut w = PmtilesWriter::create(
+            &path, 0, 14, (-180.0, -85.0, 180.0, 85.0),
+            "test_layer", "elev", 100,
+        ).unwrap();
+
+        // Three tiny tiles. They should be gzipped (so written bytes != raw bytes)
+        // and appended in order.
+        let raw_a = b"AAA".repeat(50);
+        let raw_b = b"BB".repeat(40);
+        let raw_c = b"CCCC".repeat(30);
+
+        let start = w.tile_data_section_start;
+        w.add_tile(0, 0, 0, &raw_a).unwrap();
+        let after_a = w.next_tile_offset;
+        w.add_tile(1, 0, 0, &raw_b).unwrap();
+        let after_b = w.next_tile_offset;
+        w.add_tile(1, 0, 1, &raw_c).unwrap();
+        let after_c = w.next_tile_offset;
+
+        assert!(after_a > start, "first tile must advance the cursor");
+        assert!(after_b > after_a);
+        assert!(after_c > after_b);
+
+        // leaf_buffer holds three entries (less than DEFAULT_LEAF_SIZE).
+        assert_eq!(w.leaf_buffer.len(), 3);
+        assert_eq!(w.leaf_buffer[0].tile_id, tile_id(0, 0, 0));
+        assert_eq!(w.leaf_buffer[1].tile_id, tile_id(1, 0, 0));
+        assert_eq!(w.leaf_buffer[2].tile_id, tile_id(1, 0, 1));
+    }
+
+    #[test]
+    fn add_tile_rejects_non_monotonic_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.pmtiles");
+        let mut w = PmtilesWriter::create(
+            &path, 0, 14, (-180.0, -85.0, 180.0, 85.0),
+            "test", "elev", 10,
+        ).unwrap();
+        // tile_id(1,0,0) = 1, tile_id(0,0,0) = 0 — going backwards is rejected.
+        w.add_tile(1, 0, 0, b"hello").unwrap();
+        let err = w.add_tile(0, 0, 0, b"world").unwrap_err();
+        assert!(format!("{err}").contains("tile_id"), "err was: {err}");
+    }
+
+    #[test]
+    fn add_tile_flushes_leaf_when_buffer_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.pmtiles");
+        let mut w = PmtilesWriter::create(
+            &path, 0, 3, (-180.0, -85.0, 180.0, 85.0),
+            "test", "elev", 100,
+        ).unwrap();
+        // Force a tiny leaf_size for the test.
+        w.leaf_size = 4;
+
+        // Build a Hilbert-ordered list of (z,x,y) and walk the first 10.
+        // (Linearly walking x at fixed y is NOT Hilbert order — would be
+        // rejected by the writer's monotonic-id check.)
+        let mut all: Vec<(u8, u32, u32)> = Vec::new();
+        for z in 0u8..=3 {
+            let n = 1u32 << z;
+            for x in 0..n { for y in 0..n { all.push((z, x, y)); } }
+        }
+        all.sort_by_key(|&(z, x, y)| tile_id(z, x, y));
+
+        for &(z, x, y) in all.iter().take(10) {
+            w.add_tile(z, x, y, &vec![0u8; 32]).unwrap();
+        }
+        // 10 tiles, leaf size 4 → 2 leaves flushed (8 entries), 2 remain in buffer.
+        assert_eq!(w.root_entries.len(), 2);
+        assert_eq!(w.leaf_buffer.len(), 2);
+        assert_eq!(w.total_addressed, 10);
     }
 }
