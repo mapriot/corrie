@@ -167,6 +167,118 @@ pub fn deserialize_directory(buf: &[u8]) -> anyhow::Result<Vec<DirEntry>> {
     }).collect())
 }
 
+// ---------------- Header (127 bytes, PMTiles v3) ----------------
+
+pub const HEADER_SIZE: usize = 127;
+const MAGIC: &[u8; 7] = b"PMTiles";
+const SPEC_VERSION: u8 = 3;
+
+// Compression enum values from PMTiles v3 spec.
+pub const COMPRESSION_NONE: u8 = 1;
+pub const COMPRESSION_GZIP: u8 = 2;
+
+// Tile-type enum values from PMTiles v3 spec.
+pub const TILE_TYPE_MVT: u8 = 1;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Header {
+    pub root_dir_offset: u64,
+    pub root_dir_bytes: u64,
+    pub json_metadata_offset: u64,
+    pub json_metadata_bytes: u64,
+    pub leaf_dirs_offset: u64,
+    pub leaf_dirs_bytes: u64,
+    pub tile_data_offset: u64,
+    pub tile_data_bytes: u64,
+    pub addressed_tiles_count: u64,
+    pub tile_entries_count: u64,
+    pub tile_contents_count: u64,
+    pub clustered: bool,
+    pub internal_compression: u8,
+    pub tile_compression: u8,
+    pub tile_type: u8,
+    pub min_zoom: u8,
+    pub max_zoom: u8,
+    pub min_lon_e7: i32,
+    pub min_lat_e7: i32,
+    pub max_lon_e7: i32,
+    pub max_lat_e7: i32,
+    pub center_zoom: u8,
+    pub center_lon_e7: i32,
+    pub center_lat_e7: i32,
+}
+
+pub fn serialize_header(h: &Header) -> [u8; HEADER_SIZE] {
+    let mut b = [0u8; HEADER_SIZE];
+    b[0..7].copy_from_slice(MAGIC);
+    b[7] = SPEC_VERSION;
+    b[8..16].copy_from_slice(&h.root_dir_offset.to_le_bytes());
+    b[16..24].copy_from_slice(&h.root_dir_bytes.to_le_bytes());
+    b[24..32].copy_from_slice(&h.json_metadata_offset.to_le_bytes());
+    b[32..40].copy_from_slice(&h.json_metadata_bytes.to_le_bytes());
+    b[40..48].copy_from_slice(&h.leaf_dirs_offset.to_le_bytes());
+    b[48..56].copy_from_slice(&h.leaf_dirs_bytes.to_le_bytes());
+    b[56..64].copy_from_slice(&h.tile_data_offset.to_le_bytes());
+    b[64..72].copy_from_slice(&h.tile_data_bytes.to_le_bytes());
+    b[72..80].copy_from_slice(&h.addressed_tiles_count.to_le_bytes());
+    b[80..88].copy_from_slice(&h.tile_entries_count.to_le_bytes());
+    b[88..96].copy_from_slice(&h.tile_contents_count.to_le_bytes());
+    b[96] = h.clustered as u8;
+    b[97] = h.internal_compression;
+    b[98] = h.tile_compression;
+    b[99] = h.tile_type;
+    b[100] = h.min_zoom;
+    b[101] = h.max_zoom;
+    b[102..106].copy_from_slice(&h.min_lon_e7.to_le_bytes());
+    b[106..110].copy_from_slice(&h.min_lat_e7.to_le_bytes());
+    b[110..114].copy_from_slice(&h.max_lon_e7.to_le_bytes());
+    b[114..118].copy_from_slice(&h.max_lat_e7.to_le_bytes());
+    b[118] = h.center_zoom;
+    b[119..123].copy_from_slice(&h.center_lon_e7.to_le_bytes());
+    b[123..127].copy_from_slice(&h.center_lat_e7.to_le_bytes());
+    b
+}
+
+pub fn deserialize_header(b: &[u8]) -> anyhow::Result<Header> {
+    if b.len() < HEADER_SIZE { anyhow::bail!("header too short"); }
+    if &b[0..7] != MAGIC { anyhow::bail!("not a PMTiles file"); }
+    if b[7] != SPEC_VERSION {
+        anyhow::bail!("unsupported PMTiles version {}", b[7]);
+    }
+    let u = |r: std::ops::Range<usize>| -> u64 {
+        u64::from_le_bytes(b[r].try_into().unwrap())
+    };
+    let i = |r: std::ops::Range<usize>| -> i32 {
+        i32::from_le_bytes(b[r].try_into().unwrap())
+    };
+    Ok(Header {
+        root_dir_offset:        u(8..16),
+        root_dir_bytes:         u(16..24),
+        json_metadata_offset:   u(24..32),
+        json_metadata_bytes:    u(32..40),
+        leaf_dirs_offset:       u(40..48),
+        leaf_dirs_bytes:        u(48..56),
+        tile_data_offset:       u(56..64),
+        tile_data_bytes:        u(64..72),
+        addressed_tiles_count:  u(72..80),
+        tile_entries_count:     u(80..88),
+        tile_contents_count:    u(88..96),
+        clustered:              b[96] != 0,
+        internal_compression:   b[97],
+        tile_compression:       b[98],
+        tile_type:              b[99],
+        min_zoom:               b[100],
+        max_zoom:               b[101],
+        min_lon_e7:             i(102..106),
+        min_lat_e7:             i(106..110),
+        max_lon_e7:             i(110..114),
+        max_lat_e7:             i(114..118),
+        center_zoom:            b[118],
+        center_lon_e7:          i(119..123),
+        center_lat_e7:          i(123..127),
+    })
+}
+
 // ---------------- TEMPORARY OLD STUB — REMOVED in Task 11 ----------------
 
 use std::path::Path;
@@ -369,5 +481,68 @@ mod tests {
         let bytes = serialize_directory(&entries);
         let decoded = deserialize_directory(&bytes).unwrap();
         assert_eq!(decoded, entries);
+    }
+
+    #[test]
+    fn header_round_trip() {
+        let h = Header {
+            root_dir_offset: 127,
+            root_dir_bytes: 4096,
+            json_metadata_offset: 4223,
+            json_metadata_bytes: 256,
+            leaf_dirs_offset: 4479,
+            leaf_dirs_bytes: 1_000_000,
+            tile_data_offset: 1_004_479,
+            tile_data_bytes: 500_000_000,
+            addressed_tiles_count: 73_227,
+            tile_entries_count: 43_211,
+            tile_contents_count: 43_211,
+            clustered: true,
+            internal_compression: COMPRESSION_GZIP,
+            tile_compression: COMPRESSION_GZIP,
+            tile_type: TILE_TYPE_MVT,
+            min_zoom: 11,
+            max_zoom: 14,
+            min_lon_e7: 120_000_000,
+            min_lat_e7: 485_000_000,
+            max_lon_e7: 189_000_000,
+            max_lat_e7: 511_000_000,
+            center_zoom: 12,
+            center_lon_e7: 154_500_000,
+            center_lat_e7: 498_000_000,
+        };
+        let bytes = serialize_header(&h);
+        let decoded = deserialize_header(&bytes).unwrap();
+        assert_eq!(decoded, h);
+    }
+
+    #[test]
+    fn header_size_is_127_bytes() {
+        let h = Header::default();
+        let bytes = serialize_header(&h);
+        assert_eq!(bytes.len(), 127);
+    }
+
+    #[test]
+    fn header_starts_with_magic_and_version() {
+        let h = Header::default();
+        let bytes = serialize_header(&h);
+        assert_eq!(&bytes[0..7], MAGIC);
+        assert_eq!(bytes[7], SPEC_VERSION);
+    }
+
+    #[test]
+    fn deserialize_rejects_wrong_magic() {
+        let mut bytes = [0u8; HEADER_SIZE];
+        bytes[7] = SPEC_VERSION;
+        assert!(deserialize_header(&bytes).is_err());
+    }
+
+    #[test]
+    fn deserialize_rejects_wrong_version() {
+        let mut bytes = [0u8; HEADER_SIZE];
+        bytes[0..7].copy_from_slice(MAGIC);
+        bytes[7] = 99;
+        assert!(deserialize_header(&bytes).is_err());
     }
 }
