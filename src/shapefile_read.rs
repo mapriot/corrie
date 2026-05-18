@@ -1,10 +1,17 @@
 //! Streaming SHP+DBF reader specialised for contour-line shapefiles.
 //!
+//! Backed by GDAL/OGR. We previously used the pure-Rust `shapefile` crate
+//! but it overflows i32 byte-offsets on `.shp` files larger than 2 GB, and
+//! the mapriot dataset has multiple country tiles past that boundary
+//! (e.g. `contours/au/final_contours_6_4_0_1.shp` at 2.5 GB).
+//!
 //! Each emitted feature carries the polyline coordinates already projected
 //! from `(lon, lat)` WGS84 to `(lon, latp)` tilemaker space, the integer
 //! elevation, and the bbox in `(lon, latp)`.
 
 use anyhow::{anyhow, Context, Result};
+use gdal::vector::{Geometry, LayerAccess, OGRwkbGeometryType};
+use gdal::Dataset;
 use std::path::Path;
 
 use crate::mercator::lat2latp;
@@ -22,21 +29,16 @@ pub struct ReadFeature {
     pub bbox_max_latp: f64,
 }
 
-use shapefile::dbase::FieldValue;
-use shapefile::{Reader, Shape};
-
-/// Read polyline features from a shapefile, projecting lat→latp, and invoke
-/// `emit` once per emitted feature.
+/// Read polyline features from a shapefile via GDAL/OGR, projecting
+/// lat→latp, and invoke `emit` once per emitted feature.
 ///
 /// Streaming: no per-shapefile accumulator. Each feature is yielded to the
-/// caller as soon as it has been parsed and its coords vec allocated, then
-/// the caller can move that vec straight onto the on-disk feature store
-/// without retaining it.
+/// caller as soon as it has been parsed, so the caller can move that vec
+/// straight onto the on-disk feature store without retaining it.
 ///
 /// Reads the column named by `elevation_field` from the DBF and floors it
-/// into an i16. Records of unsupported geometry types fail the whole shp;
-/// records missing the elevation column or with non-numeric values are
-/// skipped with a warning to stderr.
+/// into an i16. Records of unsupported geometry types fail the whole shp.
+/// Records with null elevation are skipped with a warning to stderr.
 pub fn read_polylines_streaming<F>(
     shp_path: &Path,
     elevation_field: &str,
@@ -45,75 +47,93 @@ pub fn read_polylines_streaming<F>(
 where
     F: FnMut(ReadFeature) -> Result<()>,
 {
-    let mut reader = Reader::from_path(shp_path)
+    let ds = Dataset::open(shp_path)
         .with_context(|| format!("open {:?}", shp_path))?;
+    let mut layer = ds.layer(0)
+        .with_context(|| format!("open layer 0 of {:?}", shp_path))?;
 
-    for (i, shape_rec) in reader.iter_shapes_and_records().enumerate() {
-        let (shape, record) = shape_rec
-            .with_context(|| format!("read record {} of {:?}", i, shp_path))?;
+    // Look up the elevation field index once. `field_as_double(idx)` is
+    // cheaper per-feature than `field_index(name)` would be.
+    let elev_idx = {
+        let mut idx = None;
+        for (i, fd) in layer.defn().fields().enumerate() {
+            if fd.name() == elevation_field { idx = Some(i); break; }
+        }
+        idx.with_context(|| format!(
+            "field {:?} not found in {:?}", elevation_field, shp_path
+        ))?
+    };
 
-        // Elevation from DBF.
-        let elev_f64 = match record.get(elevation_field) {
-            Some(FieldValue::Numeric(Some(v))) => *v,
-            Some(FieldValue::Integer(v)) => *v as f64,
-            Some(other) => {
-                eprintln!("warning: record {} elevation field has unsupported type {:?}", i, other);
+    let mut rec_idx: u64 = 0;
+    for feature in layer.features() {
+        let elev_f64 = match feature.field_as_double(elev_idx) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                eprintln!("warning: record {} of {:?} has null elevation", rec_idx, shp_path);
+                rec_idx += 1;
                 continue;
             }
-            None => {
-                eprintln!("warning: record {} missing elevation field {:?}", i, elevation_field);
+            Err(e) => {
+                eprintln!("warning: record {} of {:?} elevation read error: {}", rec_idx, shp_path, e);
+                rec_idx += 1;
                 continue;
             }
         };
         let elevation_i32 = elev_f64.floor() as i32;
         let elevation = elevation_i32.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
 
-        // Iterate parts directly, projecting and emitting per-part without
-        // a per-shapefile Vec.
-        match shape {
-            Shape::Polyline(pl) => {
-                for part in pl.parts() {
-                    let coords: Vec<[f64; 2]> = part.iter().map(|p| [p.x, lat2latp(p.y)]).collect();
-                    emit_part(coords, elevation, &mut emit)?;
+        let geom = match feature.geometry() {
+            Some(g) => g,
+            None => { rec_idx += 1; continue; }
+        };
+
+        // Flatten Z/M variants so PolylineZ / PolylineM hit the same arm
+        // as plain LineString.
+        let flat = gdal::vector::geometry_type_flatten(geom.geometry_type());
+        match flat {
+            OGRwkbGeometryType::wkbLineString => {
+                emit_linestring(geom, elevation, &mut emit)?;
+            }
+            OGRwkbGeometryType::wkbMultiLineString => {
+                let n = geom.geometry_count();
+                for i in 0..n {
+                    let sub = geom.get_geometry(i);
+                    emit_linestring(&sub, elevation, &mut emit)?;
                 }
             }
-            Shape::PolylineM(pl) => {
-                for part in pl.parts() {
-                    let coords: Vec<[f64; 2]> = part.iter().map(|p| [p.x, lat2latp(p.y)]).collect();
-                    emit_part(coords, elevation, &mut emit)?;
-                }
-            }
-            Shape::PolylineZ(pl) => {
-                for part in pl.parts() {
-                    let coords: Vec<[f64; 2]> = part.iter().map(|p| [p.x, lat2latp(p.y)]).collect();
-                    emit_part(coords, elevation, &mut emit)?;
-                }
-            }
-            Shape::NullShape => continue,
-            other => {
+            _ => {
                 return Err(anyhow!(
-                    "shapefile {:?} record {} has unsupported geometry type {:?}",
-                    shp_path, i, other.shapetype()
+                    "shapefile {:?} record {} has unsupported geometry type {}",
+                    shp_path, rec_idx,
+                    gdal::vector::geometry_type_to_name(geom.geometry_type())
                 ));
             }
         }
+        rec_idx += 1;
     }
     Ok(())
 }
 
-fn emit_part<F>(coords: Vec<[f64; 2]>, elevation: i16, emit: &mut F) -> Result<()>
+fn emit_linestring<F>(geom: &Geometry, elevation: i16, emit: &mut F) -> Result<()>
 where
     F: FnMut(ReadFeature) -> Result<()>,
 {
-    if coords.len() < 2 { return Ok(()); }
+    let n = geom.point_count();
+    if n < 2 { return Ok(()); }
+
+    let mut coords: Vec<[f64; 2]> = Vec::with_capacity(n);
     let (mut mnx, mut mny) = (f64::INFINITY, f64::INFINITY);
     let (mut mxx, mut mxy) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-    for c in &coords {
-        if c[0] < mnx { mnx = c[0]; }
-        if c[1] < mny { mny = c[1]; }
-        if c[0] > mxx { mxx = c[0]; }
-        if c[1] > mxy { mxy = c[1]; }
+    for i in 0..n {
+        let (x, y, _z) = geom.get_point(i as i32);
+        let latp = lat2latp(y);
+        coords.push([x, latp]);
+        if x < mnx { mnx = x; }
+        if x > mxx { mxx = x; }
+        if latp < mny { mny = latp; }
+        if latp > mxy { mxy = latp; }
     }
+
     emit(ReadFeature {
         coords,
         elevation,
