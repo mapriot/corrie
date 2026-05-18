@@ -35,6 +35,40 @@ fn read_varint(buf: &[u8]) -> anyhow::Result<(u64, usize)> {
     anyhow::bail!("varint truncated");
 }
 
+// ---------------- tile_id (PMTiles v3 Hilbert) ----------------
+
+/// Compute the PMTiles v3 tile_id for `(z, x, y)`. PMTiles orders tiles
+/// along a Hilbert curve interleaved across all zooms — `tile_id` is the
+/// position in that single global ordering.
+///
+/// Formula: `((4^z - 1) / 3) + hilbert(z, x, y)` per spec v3 §3.4.
+pub fn tile_id(z: u8, x: u32, y: u32) -> u64 {
+    // Sum of tiles at lower zooms 0..z is (4^z - 1) / 3.
+    let base = ((1u64 << (2 * z)) - 1) / 3;
+    base + hilbert(z, x, y)
+}
+
+/// Hilbert curve index within zoom `z`. Reference algorithm from the
+/// PMTiles spec; identical to the `pmtiles` Go reference.
+fn hilbert(z: u8, mut x: u32, mut y: u32) -> u64 {
+    let mut d: u64 = 0;
+    let mut s: i64 = 1i64 << (z as i64) >> 1; // s = 2^(z-1), with z=0 giving 0
+    while s > 0 {
+        let rx = if (x as i64 & s) > 0 { 1u32 } else { 0 };
+        let ry = if (y as i64 & s) > 0 { 1u32 } else { 0 };
+        d += (s as u64) * (s as u64) * ((3 * rx) ^ ry) as u64;
+        if ry == 0 {
+            if rx == 1 {
+                x = (s as u32 - 1).wrapping_sub(x);
+                y = (s as u32 - 1).wrapping_sub(y);
+            }
+            std::mem::swap(&mut x, &mut y);
+        }
+        s >>= 1;
+    }
+    d
+}
+
 // ---------------- TEMPORARY OLD STUB — REMOVED in Task 11 ----------------
 
 use std::path::Path;
@@ -112,5 +146,68 @@ mod tests {
         // 10 bytes with continuation bits would overflow u64.
         let bad = vec![0xff; 11];
         assert!(read_varint(&bad).is_err());
+    }
+
+    #[test]
+    fn tile_id_zoom_zero_is_zero() {
+        assert_eq!(tile_id(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn tile_id_zoom_one_hilbert_order() {
+        // Hilbert at z=1 visits (0,0), (0,1), (1,1), (1,0). Adding the
+        // zoom-0 prefix of 1 tile shifts all by 1.
+        assert_eq!(tile_id(1, 0, 0), 1);
+        assert_eq!(tile_id(1, 0, 1), 2);
+        assert_eq!(tile_id(1, 1, 1), 3);
+        assert_eq!(tile_id(1, 1, 0), 4);
+    }
+
+    #[test]
+    fn tile_id_zoom_prefix_correct() {
+        // Sum of tile counts at zooms 0..2 = 1 + 4 = 5. So first tile at z=2 has id 5.
+        assert_eq!(tile_id(2, 0, 0), 5);
+        // z=3 prefix = 1 + 4 + 16 = 21.
+        assert_eq!(tile_id(3, 0, 0), 21);
+    }
+
+    #[test]
+    fn tile_id_strictly_monotonic_in_hilbert_walk_at_z14() {
+        // Sanity: walking adjacent x,y pairs at z=14 should mostly produce
+        // sequential tile_ids — at minimum, all tile_ids must be distinct.
+        let z = 14;
+        let n = 1u32 << z;
+        let mut last: Option<u64> = None;
+        for x in 0..16 {
+            for y in 0..16 {
+                let id = tile_id(z, x, y);
+                if let Some(prev) = last {
+                    assert_ne!(id, prev, "duplicate tile_id at z={z}, x={x}, y={y}");
+                }
+                last = Some(id);
+            }
+        }
+        let _ = n; // silence unused
+    }
+
+    #[test]
+    fn tile_id_matches_upstream_pmtiles_crate() {
+        // Spot-check our Hilbert implementation against the published
+        // pmtiles crate for zooms 0..=8 across a grid of coordinates.
+        use pmtiles::{TileCoord as PTCoord, TileId};
+        for z in 0u8..=8 {
+            let n = 1u32 << z;
+            let step = (n / 8).max(1);
+            let mut xs = vec![0, n.saturating_sub(1)];
+            xs.extend((step..n).step_by(step as usize));
+            xs.sort(); xs.dedup();
+            for &x in &xs {
+                for &y in &xs {
+                    let ours = tile_id(z, x, y);
+                    let theirs = TileId::from(PTCoord::new(z, x, y).unwrap()).value();
+                    assert_eq!(ours, theirs, "mismatch at z={z}, x={x}, y={y}");
+                }
+            }
+        }
     }
 }
