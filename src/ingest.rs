@@ -9,6 +9,7 @@
 //! count.
 
 use anyhow::{Context, Result};
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
@@ -56,12 +57,22 @@ pub fn run(
     let mut bbox_entries: Vec<FeatureBbox> = Vec::new();
     let mut idx: u32 = 0;
 
+    // Per-SHP progress bar. Ticks once per SHP fully read by the parallel
+    // reader pool. Same template as the tile-generation bar so the two
+    // phases look consistent. indicatif degrades cleanly to one line per
+    // update when stderr is not a TTY (e.g. piped through `tee`).
+    let pb = ProgressBar::new(parallel_inputs.len() as u64);
+    pb.set_style(ProgressStyle::with_template(
+        "[{elapsed_precise}] {bar:45.green/blue} {pos:>4}/{len} SHPs {per_sec} eta {eta}"
+    ).unwrap());
+
     // `std::thread::scope` lets the reader thread borrow `parallel_inputs`
     // without 'static, and guarantees it joins before we exit the scope.
     let read_result: Result<()> = std::thread::scope(|scope| {
         // Spawn one reader-coordinator thread; inside it, rayon parallelises
         // across SHPs. Each emit sends one feature through the bounded channel.
         let inputs_ref = &parallel_inputs;
+        let pb_ref = &pb;
         let read_handle = scope.spawn(move || -> Result<()> {
             inputs_ref.par_iter().try_for_each(|(lid, s, col)| -> Result<()> {
                 let lid = *lid;
@@ -70,6 +81,7 @@ pub fn run(
                     tx.send(StreamItem { layer_id: lid, feature })
                         .map_err(|_| anyhow::anyhow!("writer thread terminated"))
                 }).with_context(|| format!("read {:?}", s.shp_path))?;
+                pb_ref.inc(1);
                 Ok(())
             })?;
             // Drop the last `tx` clone here so the channel closes when all
@@ -101,6 +113,7 @@ pub fn run(
         }
     });
     read_result?;
+    pb.finish_and_clear();
 
     let n_features = builder.n_features();
     let n_vertices = builder.n_vertices();
