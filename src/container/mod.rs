@@ -22,10 +22,11 @@ impl Writer {
         bounds: (f64, f64, f64, f64),
         layer_name: &str,
         elevation_attr: &str,
+        tile_count_estimate: u64,
     ) -> Result<Self> {
         match path.extension().and_then(|e| e.to_str()) {
             Some("pmtiles") => Ok(Self::Pmtiles(PmtilesWriter::create(
-                path, min_z, max_z, bounds, layer_name, elevation_attr,
+                path, min_z, max_z, bounds, layer_name, elevation_attr, tile_count_estimate,
             )?)),
             Some("mbtiles") => Ok(Self::Mbtiles(MbtilesWriter::create(path, min_z, max_z)?)),
             other => bail!(

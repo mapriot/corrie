@@ -279,30 +279,156 @@ pub fn deserialize_header(b: &[u8]) -> anyhow::Result<Header> {
     })
 }
 
-// ---------------- TEMPORARY OLD STUB — REMOVED in Task 11 ----------------
+// ---------------- gzip (uses flate2, already in deps) ----------------
 
+fn gzip(input: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut enc = GzEncoder::new(Vec::with_capacity(input.len() / 2), Compression::default());
+    enc.write_all(input)?;
+    Ok(enc.finish()?)
+}
+
+// ---------------- PmtilesWriter ----------------
+
+use std::fs::File;
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
+use anyhow::Context;
 
-pub struct PmtilesWriter;
+/// Reservation sizes (bytes) at the start of every output file. The leaves
+/// reservation is computed from `tile_count_estimate` at create time.
+const ROOT_RESERVED: u64     = 4 * 1024 * 1024;   // 4 MB
+const METADATA_RESERVED: u64 = 128 * 1024;        // 128 KB
+const LEAF_BYTES_PER_ENTRY: u64 = 20;             // upper bound on varint-encoded directory entry size
+
+/// Default entries per leaf directory. Sized so the in-memory leaf
+/// buffer stays under ~400 KB and the root directory stays small.
+pub const DEFAULT_LEAF_SIZE: usize = 16_384;
+
+pub struct PmtilesWriter {
+    file: BufWriter<File>,
+    /// First byte of tile data section (= header + root_res + meta_res + leaves_res).
+    tile_data_section_start: u64,
+    /// Next absolute file offset where the next tile's bytes will be written.
+    next_tile_offset: u64,
+    /// Bounds of the leaves reservation: cursor must stay within
+    /// [leaves_reserved_start, leaves_reserved_end).
+    leaves_reserved_start: u64,
+    leaves_reserved_end: u64,
+    /// Cursor into the leaves reservation; advances as leaves are flushed.
+    leaves_cursor: u64,
+    /// Current leaf being filled. Reset after every flush.
+    leaf_buffer: Vec<DirEntry>,
+    /// One entry per finalized leaf, accumulated for the root directory.
+    root_entries: Vec<DirEntry>,
+    /// Configured leaf size.
+    leaf_size: usize,
+    /// Header fields that don't change after create — keep them so finalize can patch.
+    min_zoom: u8,
+    max_zoom: u8,
+    bounds_e7: (i32, i32, i32, i32),
+    center_e7: (i32, i32),
+    center_zoom: u8,
+    /// Metadata JSON, computed at create time from layer/elevation names.
+    metadata_json: String,
+    /// Strict-monotonic check.
+    last_tile_id: Option<u64>,
+    /// Running count of tiles written. Used by finalize for header fields.
+    total_addressed: u64,
+}
 
 impl PmtilesWriter {
     pub fn create(
-        _path: &Path,
-        _min_z: u8,
-        _max_z: u8,
-        _bounds: (f64, f64, f64, f64),
-        _layer_name: &str,
-        _elevation_attr: &str,
+        path: &Path,
+        min_z: u8,
+        max_z: u8,
+        bounds: (f64, f64, f64, f64),
+        layer_name: &str,
+        elevation_attr: &str,
+        tile_count_estimate: u64,
     ) -> anyhow::Result<Self> {
-        anyhow::bail!("PmtilesWriter is being rewritten; this stub should be unreachable in tests")
+        let (west, south, east, north) = bounds;
+        let center_lon = (west + east) / 2.0;
+        let center_lat = (south + north) / 2.0;
+        let center_zoom = ((min_z + max_z) / 2).max(min_z);
+
+        // TileJSON 3.0 vector_layers — required by MapLibre for layer introspection.
+        // Matches the metadata schema corrie wrote pre-rewrite.
+        let metadata_json = format!(
+            r#"{{"vector_layers":[{{"id":"{layer_name}","fields":{{"{elevation_attr}":"Number","main":"Number","show":"Number"}},"minzoom":{min_z},"maxzoom":{max_z}}}]}}"#
+        );
+
+        let leaves_reserved = tile_count_estimate.saturating_mul(LEAF_BYTES_PER_ENTRY).max(1024);
+
+        let mut f = BufWriter::new(File::create(path).with_context(|| format!("create {:?}", path))?);
+
+        // Zero-pad the [Header][Root][Metadata][Leaves] regions so we can
+        // seek-and-write them at finalize without leaving uninitialized bytes
+        // in the file. Sequential write of zeros at the start is cheap and
+        // gives us a known cursor position for tile data to begin from.
+        let total_reservation = HEADER_SIZE as u64
+            + ROOT_RESERVED
+            + METADATA_RESERVED
+            + leaves_reserved;
+        write_zeros(&mut f, total_reservation)?;
+
+        let leaves_reserved_start = HEADER_SIZE as u64 + ROOT_RESERVED + METADATA_RESERVED;
+        let leaves_reserved_end = leaves_reserved_start + leaves_reserved;
+        let tile_data_section_start = leaves_reserved_end;
+
+        Ok(Self {
+            file: f,
+            tile_data_section_start,
+            next_tile_offset: tile_data_section_start,
+            leaves_reserved_start,
+            leaves_reserved_end,
+            leaves_cursor: leaves_reserved_start,
+            leaf_buffer: Vec::with_capacity(DEFAULT_LEAF_SIZE),
+            root_entries: Vec::new(),
+            leaf_size: DEFAULT_LEAF_SIZE,
+            min_zoom: min_z,
+            max_zoom: max_z,
+            bounds_e7: (
+                (west  * 1e7).round() as i32,
+                (south * 1e7).round() as i32,
+                (east  * 1e7).round() as i32,
+                (north * 1e7).round() as i32,
+            ),
+            center_e7: (
+                (center_lon * 1e7).round() as i32,
+                (center_lat * 1e7).round() as i32,
+            ),
+            center_zoom,
+            metadata_json,
+            last_tile_id: None,
+            total_addressed: 0,
+        })
     }
-    pub fn add_tile(&mut self, _z: u8, _x: u32, _y: u32, _data: &[u8]) -> anyhow::Result<()> {
-        unreachable!()
+
+    /// To be implemented in Task 6.
+    pub fn add_tile(&mut self, _z: u8, _x: u32, _y: u32, _mvt_raw: &[u8]) -> anyhow::Result<()> {
+        anyhow::bail!("add_tile not yet implemented — Task 6")
     }
+
+    /// To be implemented in Task 7.
     pub fn finalize(self) -> anyhow::Result<()> {
-        unreachable!()
+        anyhow::bail!("finalize not yet implemented — Task 7")
     }
 }
+
+fn write_zeros<W: Write>(w: &mut W, n: u64) -> anyhow::Result<()> {
+    const ZERO_CHUNK: [u8; 64 * 1024] = [0u8; 64 * 1024];
+    let mut remaining = n;
+    while remaining > 0 {
+        let chunk = remaining.min(ZERO_CHUNK.len() as u64) as usize;
+        w.write_all(&ZERO_CHUNK[..chunk])?;
+        remaining -= chunk as u64;
+    }
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -544,5 +670,26 @@ mod tests {
         bytes[0..7].copy_from_slice(MAGIC);
         bytes[7] = 99;
         assert!(deserialize_header(&bytes).is_err());
+    }
+
+    #[test]
+    fn create_reserves_correct_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.pmtiles");
+        let w = PmtilesWriter::create(
+            &path, 11, 14, (12.0, 48.5, 18.9, 51.1),
+            "contour", "elevation", 1000,
+        ).unwrap();
+
+        // Layout: [Header 127][Root 4M][Metadata 128K][Leaves 1000*20=20000][Tile data]
+        assert_eq!(w.leaves_reserved_start, 127 + 4*1024*1024 + 128*1024);
+        assert_eq!(w.leaves_reserved_end,   w.leaves_reserved_start + 20_000);
+        assert_eq!(w.tile_data_section_start, w.leaves_reserved_end);
+        assert_eq!(w.next_tile_offset, w.tile_data_section_start);
+
+        // The reservation is zero-padded; file size should equal it.
+        drop(w);
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 127 + 4*1024*1024 + 128*1024 + 20_000);
     }
 }
