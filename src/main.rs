@@ -2,7 +2,6 @@ use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
-use pmtiles::{TileCoord, TileId};
 use rayon::prelude::*;
 
 use corrie::container::Writer;
@@ -414,8 +413,9 @@ fn run_build(args: BuildArgs) -> anyhow::Result<()> {
         args.output.extension().and_then(|e| e.to_str()) == Some("pmtiles");
     if needs_hilbert_sort {
         eprintln!("Sorting {} tiles by Hilbert ID...", tiles.len());
+        use corrie::container::pmtiles::tile_id;
         tiles.sort_by_cached_key(|&(z, x, y)| {
-            TileId::from(TileCoord::new(z, x, y).expect("valid coord")).value()
+            tile_id(z, x, y)
         });
     }
 
