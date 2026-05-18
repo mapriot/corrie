@@ -73,10 +73,12 @@ pub enum GeomType {
 
 pub const EXTENT: u32 = 4096;
 
-/// A contour ready for MVT encoding.
+/// A contour ready for MVT encoding. May hold multiple sub-linestrings
+/// that share the same attributes (encoded as one MultiLineString feature).
 pub struct ContourFeature {
-    /// Polyline points in MVT coordinates (0..EXTENT, y-down).
-    pub points: Vec<(i32, i32)>,
+    /// One or more sub-linestrings in MVT coordinates (0..EXTENT, y-down).
+    /// Each sub-linestring must have at least 2 points.
+    pub lines: Vec<Vec<(i32, i32)>>,
     /// Elevation in whole metres.
     pub elevation: i32,
     /// True if this is a "main" contour (e.g. every 50 m).
@@ -141,7 +143,7 @@ pub fn encode_tile(
     let mut mvt_features: Vec<Feature> = Vec::with_capacity(features.len());
 
     for (id, cf) in features.iter().enumerate() {
-        if cf.points.len() < 2 {
+        if cf.lines.is_empty() {
             continue;
         }
 
@@ -167,7 +169,7 @@ pub fn encode_tile(
             }
         }
 
-        let geometry = encode_linestring(&cf.points);
+        let geometry = encode_multilinestring(&cf.lines);
 
         mvt_features.push(Feature {
             id: Some((id + 1) as u64),
@@ -201,30 +203,37 @@ pub fn gzip_compress(data: &[u8]) -> Vec<u8> {
     enc.finish().expect("gzip finish")
 }
 
-/// Encode a LineString into MVT geometry commands.
-fn encode_linestring(points: &[(i32, i32)]) -> Vec<u32> {
-    let mut cmds = Vec::with_capacity(3 + points.len() * 2);
+/// Encode one or more LineStrings into MVT geometry commands. Multiple
+/// linestrings share one feature (MultiLineString) by repeating MoveTo+LineTo;
+/// the cursor state carries over between sub-lines.
+fn encode_multilinestring(lines: &[Vec<(i32, i32)>]) -> Vec<u32> {
+    let total_pts: usize = lines.iter().map(|l| l.len()).sum();
+    let mut cmds = Vec::with_capacity(lines.len() * 3 + total_pts * 2);
     let (mut cx, mut cy) = (0i32, 0i32);
 
-    // MoveTo(1)
-    cmds.push(command(1, 1));
-    let dx = points[0].0 - cx;
-    let dy = points[0].1 - cy;
-    cmds.push(zigzag(dx));
-    cmds.push(zigzag(dy));
-    cx = points[0].0;
-    cy = points[0].1;
+    for points in lines {
+        if points.len() < 2 { continue; }
 
-    // LineTo(n-1)
-    let n = points.len() - 1;
-    cmds.push(command(2, n as u32));
-    for &(x, y) in &points[1..] {
-        let dx = x - cx;
-        let dy = y - cy;
+        // MoveTo(1)
+        cmds.push(command(1, 1));
+        let dx = points[0].0 - cx;
+        let dy = points[0].1 - cy;
         cmds.push(zigzag(dx));
         cmds.push(zigzag(dy));
-        cx = x;
-        cy = y;
+        cx = points[0].0;
+        cy = points[0].1;
+
+        // LineTo(n-1)
+        let n = points.len() - 1;
+        cmds.push(command(2, n as u32));
+        for &(x, y) in &points[1..] {
+            let dx = x - cx;
+            let dy = y - cy;
+            cmds.push(zigzag(dx));
+            cmds.push(zigzag(dy));
+            cx = x;
+            cy = y;
+        }
     }
 
     cmds

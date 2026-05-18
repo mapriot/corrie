@@ -205,7 +205,7 @@ fn process_tile(
             }
 
             features.push(mvt::ContourFeature {
-                points: deduped,
+                lines: vec![deduped],
                 elevation: elev,
                 main: main_every > 0 && elev % main_every == 0,
                 show: show_every > 0 && elev % show_every == 0,

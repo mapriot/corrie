@@ -108,6 +108,13 @@ pub fn process_tile(
     let xscale = (max_lon - min_lon) / EXTENT as f64;
     let yscale = (max_latp - min_latp) / EXTENT as f64;
 
+    // Sub-pixel simplification floor: even when the source layer doesn't simplify
+    // at this zoom (e.g. z >= simplify_below), removing vertices that lie within
+    // half an MVT pixel of the chord between their neighbours has no visual
+    // effect — they all quantise to the same pixel — and saves real bytes.
+    // xscale == yscale in (lon, latp) space because tile y is linear in latp.
+    let subpixel_eps = 0.5 * xscale;
+
     // R-tree query: use the exact tile clip box so only features whose bbox
     // intersects the actual tile are included.
     let query = AABB::from_corners([min_lon as f32, min_latp as f32], [max_lon as f32, max_latp as f32]);
@@ -117,7 +124,12 @@ pub fn process_tile(
     // Per source-layer eps cache (one per unique simplify config encountered).
     let mut eps_cache: Vec<Option<f64>> = vec![None; sources.len()];
 
-    let mut features_out: Vec<ContourFeature> = Vec::new();
+    // Group sub-linestrings by (elevation, flags) — all features in this tile
+    // sharing the same attributes are packed into one MVT MultiLineString
+    // feature. This dramatically reduces tile size for dense contour data
+    // (each feature shares one tag table entry instead of one per sub-line).
+    use std::collections::HashMap;
+    let mut groups: HashMap<(i16, u8), Vec<Vec<(i32, i32)>>> = HashMap::new();
     let feature_recs: &[FeatureRecord] = reader.features();
 
     for fb in hits {
@@ -134,13 +146,14 @@ pub fn process_tile(
         // Per-feature minzoom gate.
         if rec_minzoom > z { continue; }
 
-        // Compute / cache eps.
+        // Compute / cache eps. Floor at half a pixel — anything finer collapses
+        // to a single MVT pixel after quantisation anyway.
         let eps = match eps_cache[rec_layer_id as usize] {
             Some(v) => v,
             None => {
                 let v = tile_eps_degp(
                     z, s.simplify_below, s.simplify_level, s.simplify_length,
-                    s.simplify_ratio, tile_centre_latp);
+                    s.simplify_ratio, tile_centre_latp).max(subpixel_eps);
                 eps_cache[rec_layer_id as usize] = Some(v);
                 v
             }
@@ -152,14 +165,10 @@ pub fn process_tile(
         // Chain vertices are original source coordinates (natural overshoot).
         let chains = build_clip_chains(coords, &clip);
         for chain in chains {
-            // Simplify in (lon, latp) degp space.
-            let simplified = if eps > 0.0 {
-                let pts: Vec<(f64, f64)> = chain.iter().map(|p| (p[0], p[1])).collect();
-                let r = simplify(&pts, eps);
-                r.into_iter().collect::<Vec<_>>()
-            } else {
-                chain.iter().map(|p| (p[0], p[1])).collect()
-            };
+            // Simplify in (lon, latp) degp space. eps is always > 0 because of
+            // the sub-pixel floor, so we always run DP.
+            let pts: Vec<(f64, f64)> = chain.iter().map(|p| (p[0], p[1])).collect();
+            let simplified: Vec<(f64, f64)> = simplify(&pts, eps);
             if simplified.len() < 2 { continue; }
 
             // Quantize to MVT extent (px, py), drop consecutive duplicates.
@@ -174,16 +183,26 @@ pub fn process_tile(
             }
             if points.len() < 2 { continue; }
 
-            features_out.push(ContourFeature {
-                points,
-                elevation: rec_elevation as i32,
-                main: (rec_flags & 0b01) != 0,
-                show: (rec_flags & 0b10) != 0,
-            });
+            groups.entry((rec_elevation, rec_flags))
+                .or_default()
+                .push(points);
         }
     }
 
-    if features_out.is_empty() { return None; }
+    if groups.is_empty() { return None; }
+
+    // Materialise features in elevation order for deterministic output.
+    let mut keys: Vec<(i16, u8)> = groups.keys().copied().collect();
+    keys.sort();
+    let features_out: Vec<ContourFeature> = keys.into_iter().map(|(elev, flags)| {
+        let lines = groups.remove(&(elev, flags)).unwrap();
+        ContourFeature {
+            lines,
+            elevation: elev as i32,
+            main: (flags & 0b01) != 0,
+            show: (flags & 0b10) != 0,
+        }
+    }).collect();
 
     let mvt = encode_tile(&features_out, output_layer_name, elevation_attr);
     Some(mvt) // raw MVT — pmtiles writer compresses
