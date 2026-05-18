@@ -7,7 +7,7 @@ fn writer_produces_clustered_output() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("smoke.pmtiles");
     let mut w = PmtilesWriter::create(
-        &path, 0, 1, (-180.0, -85.0, 180.0, 85.0), "contour", "elevation",
+        &path, 0, 1, (-180.0, -85.0, 180.0, 85.0), "contour", "elevation", 3,
     ).unwrap();
 
     // Three tiny tiles.

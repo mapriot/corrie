@@ -335,7 +335,7 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
     );
     let mut writer = PmtilesWriter::create(
         &args.output, cfg.settings.minzoom, cfg.settings.maxzoom,
-        (w, s, e, n), &output_layer, "elevation",
+        (w, s, e, n), &output_layer, "elevation", tiles.len() as u64,
     )?;
 
     // Sequential write for now; parallelise in next task.
@@ -426,6 +426,7 @@ fn run_build(args: BuildArgs) -> anyhow::Result<()> {
         (west_lon, south_lat, east_lon, north_lat),
         &args.layer,
         &args.elevation_attr,
+        tiles.len() as u64,
     )?;
 
     // ── Chunked parallel tile generation ────────────────────────────────────
