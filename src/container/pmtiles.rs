@@ -69,6 +69,104 @@ fn hilbert(z: u8, mut x: u32, mut y: u32) -> u64 {
     d
 }
 
+// ---------------- DirEntry encoding ----------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirEntry {
+    pub tile_id: u64,
+    pub run_length: u32,
+    pub offset: u64,
+    pub length: u32,
+}
+
+/// Serialize directory entries per PMTiles v3 §3.1: a count varint
+/// followed by four parallel varint arrays (tile_id_deltas,
+/// run_lengths, lengths, encoded_offsets). The output is NOT gzipped;
+/// caller is responsible for compression.
+pub fn serialize_directory(entries: &[DirEntry]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(entries.len() * 8);
+    write_varint(&mut buf, entries.len() as u64);
+
+    // 1. tile_id deltas (first absolute, rest relative to previous)
+    let mut last_id = 0u64;
+    for e in entries {
+        write_varint(&mut buf, e.tile_id - last_id);
+        last_id = e.tile_id;
+    }
+
+    // 2. run_lengths
+    for e in entries { write_varint(&mut buf, e.run_length as u64); }
+
+    // 3. lengths
+    for e in entries { write_varint(&mut buf, e.length as u64); }
+
+    // 4. encoded offsets: 0 if contiguous with previous, else offset+1
+    for i in 0..entries.len() {
+        let e = &entries[i];
+        let encoded = if i > 0 {
+            let prev = &entries[i - 1];
+            if e.offset == prev.offset + prev.length as u64 { 0 } else { e.offset + 1 }
+        } else {
+            e.offset + 1
+        };
+        write_varint(&mut buf, encoded);
+    }
+
+    buf
+}
+
+/// Inverse of `serialize_directory`. Used by tests + cross-validation.
+pub fn deserialize_directory(buf: &[u8]) -> anyhow::Result<Vec<DirEntry>> {
+    let mut cur = 0;
+    let (count, n) = read_varint(&buf[cur..])?;
+    cur += n;
+    let count = count as usize;
+
+    let mut tile_ids = Vec::with_capacity(count);
+    let mut last_id = 0u64;
+    for _ in 0..count {
+        let (delta, n) = read_varint(&buf[cur..])?;
+        cur += n;
+        last_id += delta;
+        tile_ids.push(last_id);
+    }
+
+    let mut run_lengths = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (v, n) = read_varint(&buf[cur..])?;
+        cur += n;
+        run_lengths.push(v as u32);
+    }
+
+    let mut lengths = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (v, n) = read_varint(&buf[cur..])?;
+        cur += n;
+        lengths.push(v as u32);
+    }
+
+    let mut offsets = Vec::with_capacity(count);
+    for i in 0..count {
+        let (raw, n) = read_varint(&buf[cur..])?;
+        cur += n;
+        let offset = if raw == 0 && i > 0 {
+            offsets[i - 1] + lengths[i - 1] as u64
+        } else if raw == 0 {
+            anyhow::bail!("first entry must encode offset as offset+1, got 0");
+        } else {
+            raw - 1
+        };
+        offsets.push(offset);
+    }
+
+    Ok((0..count).map(|i| DirEntry {
+        tile_id: tile_ids[i],
+        run_length: run_lengths[i],
+        offset: offsets[i],
+        length: lengths[i],
+    }).collect())
+}
+
 // ---------------- TEMPORARY OLD STUB — REMOVED in Task 11 ----------------
 
 use std::path::Path;
@@ -209,5 +307,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn directory_round_trip_single_entry() {
+        let entries = vec![DirEntry { tile_id: 42, run_length: 1, offset: 0, length: 100 }];
+        let bytes = serialize_directory(&entries);
+        let decoded = deserialize_directory(&bytes).unwrap();
+        assert_eq!(decoded, entries);
+    }
+
+    #[test]
+    fn directory_round_trip_contiguous_offsets() {
+        // Tile bytes A=[0, 100), B=[100, 250), C=[250, 300).
+        // Offset deltas should encode as 0 for the contiguous pair.
+        let entries = vec![
+            DirEntry { tile_id: 1, run_length: 1, offset: 0,   length: 100 },
+            DirEntry { tile_id: 2, run_length: 1, offset: 100, length: 150 },
+            DirEntry { tile_id: 3, run_length: 1, offset: 250, length: 50  },
+        ];
+        let bytes = serialize_directory(&entries);
+        let decoded = deserialize_directory(&bytes).unwrap();
+        assert_eq!(decoded, entries);
+    }
+
+    #[test]
+    fn directory_round_trip_non_contiguous_offsets() {
+        // Gap between tiles forces absolute offset encoding.
+        let entries = vec![
+            DirEntry { tile_id: 1, run_length: 1, offset: 0,    length: 100 },
+            DirEntry { tile_id: 2, run_length: 1, offset: 5000, length: 150 },
+        ];
+        let bytes = serialize_directory(&entries);
+        let decoded = deserialize_directory(&bytes).unwrap();
+        assert_eq!(decoded, entries);
+    }
+
+    #[test]
+    fn directory_round_trip_leaf_pointer() {
+        // Root entry pointing to a leaf: run_length=0.
+        let entries = vec![
+            DirEntry { tile_id: 0,    run_length: 0, offset: 0,      length: 1024 },
+            DirEntry { tile_id: 1000, run_length: 0, offset: 1024,   length: 2048 },
+        ];
+        let bytes = serialize_directory(&entries);
+        let decoded = deserialize_directory(&bytes).unwrap();
+        assert_eq!(decoded, entries);
+    }
+
+    #[test]
+    fn directory_round_trip_many_entries() {
+        // 1000 entries in Hilbert (sequential tile_id), contiguous bytes.
+        let entries: Vec<DirEntry> = (0..1000)
+            .map(|i| DirEntry {
+                tile_id: i as u64,
+                run_length: 1,
+                offset: (i * 256) as u64,
+                length: 256,
+            })
+            .collect();
+        let bytes = serialize_directory(&entries);
+        let decoded = deserialize_directory(&bytes).unwrap();
+        assert_eq!(decoded, entries);
     }
 }
