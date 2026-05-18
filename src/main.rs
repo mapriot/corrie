@@ -264,12 +264,9 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
             (p, true)
         }
         None => {
-            let td = tempfile::Builder::new().prefix("corrie-cache-").tempdir()
-                .context("create temp cache dir")?;
+            corrie::temp_cache::reap_orphan_caches();
+            let td = corrie::temp_cache::create_ephemeral_cache()?;
             let path = td.path().to_path_buf();
-            // Log the path so the user can manually rm -rf after a forced
-            // kill — TempDir's Drop impl doesn't run on SIGKILL / OOM.
-            eprintln!("Temp cache: {}", path.display());
             _temp_cache = Some(td);
             (path, false)
         }

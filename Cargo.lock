@@ -858,6 +858,7 @@ dependencies = [
  "gdal",
  "hilbert_2d",
  "indicatif",
+ "libc",
  "memmap2",
  "pmtiles",
  "prost",

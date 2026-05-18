@@ -32,6 +32,9 @@ hilbert_2d = "1"
 bytemuck = { version = "1", features = ["derive"] }
 tempfile = "3"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Pure-Rust shapefile crate, used by integration tests to write fixture
 # SHPs. Runtime SHP reading goes through GDAL/OGR (see src/shapefile_read.rs).

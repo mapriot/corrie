@@ -15,3 +15,4 @@ pub mod spatial_index;
 pub mod tile;
 pub mod tile_gen;
 pub mod ingest;
+pub mod temp_cache;
