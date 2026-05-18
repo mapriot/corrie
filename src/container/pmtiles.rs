@@ -479,9 +479,76 @@ impl PmtilesWriter {
         Ok(())
     }
 
-    /// To be implemented in Task 7.
-    pub fn finalize(self) -> anyhow::Result<()> {
-        anyhow::bail!("finalize not yet implemented — Task 7")
+    pub fn finalize(mut self) -> anyhow::Result<()> {
+        // 1. Flush any remaining leaf buffer.
+        self.flush_leaf()?;
+
+        // 2. Serialize + gzip the root directory.
+        let root_raw = serialize_directory(&self.root_entries);
+        let root_gz = gzip(&root_raw).context("gzip root directory")?;
+        if root_gz.len() as u64 > ROOT_RESERVED {
+            anyhow::bail!(
+                "root directory {} bytes exceeds reservation {} — increase ROOT_RESERVED",
+                root_gz.len(), ROOT_RESERVED
+            );
+        }
+
+        // 3. Gzip metadata.
+        let meta_gz = gzip(self.metadata_json.as_bytes()).context("gzip metadata")?;
+        if meta_gz.len() as u64 > METADATA_RESERVED {
+            anyhow::bail!(
+                "metadata {} bytes exceeds reservation {} — increase METADATA_RESERVED",
+                meta_gz.len(), METADATA_RESERVED
+            );
+        }
+
+        // 4. Write root into its reserved zone at offset 127.
+        self.file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
+        self.file.write_all(&root_gz)?;
+
+        // 5. Write metadata into its reserved zone.
+        let meta_offset = HEADER_SIZE as u64 + ROOT_RESERVED;
+        self.file.seek(SeekFrom::Start(meta_offset))?;
+        self.file.write_all(&meta_gz)?;
+
+        // 6. Build header with real offsets and lengths.
+        let leaves_bytes_used = self.leaves_cursor - self.leaves_reserved_start;
+        let tile_data_bytes = self.next_tile_offset - self.tile_data_section_start;
+
+        let header = Header {
+            root_dir_offset: HEADER_SIZE as u64,
+            root_dir_bytes: root_gz.len() as u64,
+            json_metadata_offset: meta_offset,
+            json_metadata_bytes: meta_gz.len() as u64,
+            leaf_dirs_offset: self.leaves_reserved_start,
+            leaf_dirs_bytes: leaves_bytes_used,
+            tile_data_offset: self.tile_data_section_start,
+            tile_data_bytes,
+            addressed_tiles_count: self.total_addressed,
+            tile_entries_count: self.total_addressed,
+            tile_contents_count: self.total_addressed,
+            clustered: true,
+            internal_compression: COMPRESSION_GZIP,
+            tile_compression: COMPRESSION_GZIP,
+            tile_type: TILE_TYPE_MVT,
+            min_zoom: self.min_zoom,
+            max_zoom: self.max_zoom,
+            min_lon_e7: self.bounds_e7.0,
+            min_lat_e7: self.bounds_e7.1,
+            max_lon_e7: self.bounds_e7.2,
+            max_lat_e7: self.bounds_e7.3,
+            center_zoom: self.center_zoom,
+            center_lon_e7: self.center_e7.0,
+            center_lat_e7: self.center_e7.1,
+        };
+
+        // 7. Seek to byte 0 and write the patched header.
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(&serialize_header(&header))?;
+
+        // 8. Flush + close.
+        self.file.flush().context("flush final pmtiles writer")?;
+        Ok(())
     }
 }
 
@@ -836,5 +903,78 @@ mod tests {
         assert_eq!(w.root_entries.len(), 2);
         assert_eq!(w.leaf_buffer.len(), 2);
         assert_eq!(w.total_addressed, 10);
+    }
+
+    #[test]
+    fn finalize_writes_valid_header_and_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.pmtiles");
+        let mut w = PmtilesWriter::create(
+            &path, 0, 14, (-180.0, -85.0, 180.0, 85.0),
+            "contour", "elevation", 100,
+        ).unwrap();
+        w.add_tile(0, 0, 0, b"first").unwrap();
+        w.add_tile(1, 0, 0, b"second").unwrap();
+        w.add_tile(1, 0, 1, b"third").unwrap();
+        w.finalize().unwrap();
+
+        // Read the header back and check section offsets are sane.
+        let bytes = std::fs::read(&path).unwrap();
+        let h = deserialize_header(&bytes[..HEADER_SIZE]).unwrap();
+        assert_eq!(h.min_zoom, 0);
+        assert_eq!(h.max_zoom, 14);
+        assert_eq!(h.tile_type, TILE_TYPE_MVT);
+        assert_eq!(h.internal_compression, COMPRESSION_GZIP);
+        assert_eq!(h.tile_compression, COMPRESSION_GZIP);
+        assert!(h.clustered);
+        assert_eq!(h.addressed_tiles_count, 3);
+        assert_eq!(h.tile_entries_count, 3);
+        assert_eq!(h.tile_contents_count, 3);
+        assert!(h.tile_data_bytes > 0);
+        assert!(h.root_dir_bytes > 0);
+        assert!(h.json_metadata_bytes > 0);
+    }
+
+    #[test]
+    fn finalize_root_directory_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.pmtiles");
+        let mut w = PmtilesWriter::create(
+            &path, 0, 14, (-180.0, -85.0, 180.0, 85.0),
+            "contour", "elevation", 100,
+        ).unwrap();
+        w.leaf_size = 2; // force two leaves from 3 tiles
+        w.add_tile(0, 0, 0, b"first").unwrap();
+        w.add_tile(1, 0, 0, b"second").unwrap();
+        w.add_tile(1, 0, 1, b"third").unwrap();
+        w.finalize().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let h = deserialize_header(&bytes[..HEADER_SIZE]).unwrap();
+
+        // Decode root directory (gzip-decompress, then deserialize).
+        let root_gz = &bytes[h.root_dir_offset as usize
+            .. (h.root_dir_offset + h.root_dir_bytes) as usize];
+        let root_raw = gunzip_for_test(root_gz);
+        let root = deserialize_directory(&root_raw).unwrap();
+        assert_eq!(root.len(), 2, "two leaves expected");
+        assert!(root.iter().all(|e| e.run_length == 0), "root entries must point to leaves");
+
+        // Decode metadata JSON.
+        let meta_gz = &bytes[h.json_metadata_offset as usize
+            .. (h.json_metadata_offset + h.json_metadata_bytes) as usize];
+        let meta_raw = gunzip_for_test(meta_gz);
+        let meta_str = std::str::from_utf8(&meta_raw).unwrap();
+        assert!(meta_str.contains("\"vector_layers\""));
+        assert!(meta_str.contains("\"contour\""));
+    }
+
+    fn gunzip_for_test(input: &[u8]) -> Vec<u8> {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut dec = GzDecoder::new(input);
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        out
     }
 }
