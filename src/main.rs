@@ -297,8 +297,34 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
         .map(|s| s.output_layer_name.clone())
         .unwrap_or_else(|| "contour".to_string());
 
-    // Enumerate tiles.
-    let mut tiles = enumerate_tiles(cfg.settings.bounding_box, cfg.settings.minzoom, cfg.settings.maxzoom);
+    // Enumerate tiles. The config bbox may be enormous (mapriot uses the
+    // whole world, [-180,-85,180,85]) but actual feature coverage is much
+    // smaller. Intersect with the R-tree's root envelope so we don't walk
+    // 100s of millions of ocean tiles that would all early-out empty.
+    use corrie::mercator::{lat2latp, latp2lat};
+    use corrie::spatial_index::rtree_bbox;
+    let cfg_bb = cfg.settings.bounding_box;
+    let cfg_min_latp = lat2latp(cfg_bb[1]);
+    let cfg_max_latp = lat2latp(cfg_bb[3]);
+    let bbox = match rtree_bbox(&rtree) {
+        Some((rmin_lon, rmin_latp, rmax_lon, rmax_latp)) => {
+            let min_lon = cfg_bb[0].max(rmin_lon);
+            let max_lon = cfg_bb[2].min(rmax_lon);
+            let min_latp = cfg_min_latp.max(rmin_latp);
+            let max_latp = cfg_max_latp.min(rmax_latp);
+            if min_lon > max_lon || min_latp > max_latp {
+                eprintln!("Feature bbox does not intersect config bounding_box; nothing to do.");
+                [0.0, 0.0, 0.0, 0.0]
+            } else {
+                [min_lon, latp2lat(min_latp), max_lon, latp2lat(max_latp)]
+            }
+        }
+        None => {
+            eprintln!("No features in ingest; nothing to do.");
+            [0.0, 0.0, 0.0, 0.0]
+        }
+    };
+    let mut tiles = enumerate_tiles(bbox, cfg.settings.minzoom, cfg.settings.maxzoom);
     eprintln!("{} tiles to process", tiles.len());
     hilbert_sort(&mut tiles);
 

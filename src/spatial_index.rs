@@ -54,3 +54,13 @@ pub fn load_rtree(dir: &Path) -> anyhow::Result<RTree<FeatureBbox>> {
     let bytes = std::fs::read(dir.join("rtree.bin"))?;
     deserialize_rtree(&bytes)
 }
+
+/// Union bounding box of every feature in the tree, in `(lon, latp)` space.
+/// Returns `None` for an empty tree. Reads directly from the root node — O(1).
+pub fn rtree_bbox(tree: &RTree<FeatureBbox>) -> Option<(f64, f64, f64, f64)> {
+    if tree.size() == 0 { return None; }
+    let env = tree.root().envelope();
+    let lo = env.lower();
+    let hi = env.upper();
+    Some((lo[0] as f64, lo[1] as f64, hi[0] as f64, hi[1] as f64))
+}
