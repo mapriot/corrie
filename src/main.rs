@@ -66,10 +66,13 @@ struct TileArgs {
     config: std::path::PathBuf,
     /// Output .pmtiles
     output: std::path::PathBuf,
-    /// Override cache directory (default: <config_dir>/.corrie-cache)
+    /// Persistent cache directory. If omitted, ingest writes to a temp dir
+    /// that's deleted on exit (no cache reuse). Pass this if you want
+    /// subsequent runs with the same SHPs to skip the ingest pass.
     #[arg(long)]
     cache_dir: Option<std::path::PathBuf>,
-    /// Force re-ingest even if cache appears valid
+    /// Force re-ingest even if cache appears valid (only meaningful with
+    /// `--cache-dir`; ignored otherwise).
     #[arg(long)]
     rebuild_cache: bool,
     #[arg(short = 'j', long)]
@@ -248,15 +251,35 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
     let cfg = parse(&args.config)?;
     let sources = parse_and_resolve(&args.config)?;
 
-    let cache_dir = match args.cache_dir {
-        Some(p) => p,
-        None => args.config.parent().unwrap_or_else(|| std::path::Path::new(".")).join(".corrie-cache"),
+    // Cache resolution:
+    //   --cache-dir <path>   → persistent, reused if SHP hash matches
+    //   (omitted)            → tempfile::TempDir, dropped at end of run
+    //
+    // Hold the TempDir alive for the whole function so the cache files
+    // survive until tile generation completes.
+    let _temp_cache: Option<tempfile::TempDir>;
+    let (cache_dir, persistent) = match args.cache_dir.clone() {
+        Some(p) => {
+            _temp_cache = None;
+            (p, true)
+        }
+        None => {
+            let td = tempfile::Builder::new().prefix("corrie-cache-").tempdir()
+                .context("create temp cache dir")?;
+            let path = td.path().to_path_buf();
+            _temp_cache = Some(td);
+            (path, false)
+        }
     };
 
     let shp_paths: Vec<PathBuf> = sources.iter().map(|s| s.shp_path.clone()).collect();
-    let needs_ingest = args.rebuild_cache || !cache_valid(&cache_dir, &shp_paths);
+    let needs_ingest = !persistent || args.rebuild_cache || !cache_valid(&cache_dir, &shp_paths);
     if needs_ingest {
-        eprintln!("Ingesting {} SHPs into {:?} ...", shp_paths.len(), cache_dir);
+        if persistent {
+            eprintln!("Ingesting {} SHPs into {:?} ...", shp_paths.len(), cache_dir);
+        } else {
+            eprintln!("Ingesting {} SHPs (ephemeral, no cache will be kept) ...", shp_paths.len());
+        }
         let t0 = std::time::Instant::now();
         let stats = ingest::run(&sources, &cache_dir)?;
         eprintln!("Ingested {} features ({} vertices) in {:.2}s",

@@ -32,6 +32,4 @@ sha2 = "0.10"
 bincode = "1"
 hilbert_2d = "1"
 bytemuck = { version = "1", features = ["derive"] }
-
-[dev-dependencies]
 tempfile = "3"
