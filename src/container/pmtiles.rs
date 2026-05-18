@@ -977,4 +977,60 @@ mod tests {
         dec.read_to_end(&mut out).unwrap();
         out
     }
+
+    #[test]
+    fn archive_round_trips_via_upstream_reader() {
+        // Build a small archive: tiles across zooms 0..3 in tile_id order.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("xcheck.pmtiles");
+        let mut w = PmtilesWriter::create(
+            &path, 0, 3, (-180.0, -85.0, 180.0, 85.0),
+            "contour", "elevation", 100,
+        ).unwrap();
+        w.leaf_size = 4; // force several leaves
+
+        // Build the (z, x, y) walk in tile_id order so add_tile accepts them.
+        let mut tiles: Vec<(u8, u32, u32)> = Vec::new();
+        for z in 0u8..=3 {
+            let n = 1u32 << z;
+            for x in 0..n {
+                for y in 0..n {
+                    tiles.push((z, x, y));
+                }
+            }
+        }
+        tiles.sort_by_key(|&(z, x, y)| tile_id(z, x, y));
+
+        // Distinct payloads per tile.
+        let payloads: Vec<Vec<u8>> = tiles.iter()
+            .map(|(z, x, y)| format!("tile-{z}-{x}-{y}").into_bytes())
+            .collect();
+
+        for (i, (z, x, y)) in tiles.iter().enumerate() {
+            w.add_tile(*z, *x, *y, &payloads[i]).unwrap();
+        }
+        w.finalize().unwrap();
+
+        // Read back via upstream pmtiles crate.
+        use pmtiles::AsyncPmTilesReader;
+
+        // Use the blocking reader by spinning a tokio runtime locally.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let reader = AsyncPmTilesReader::new_with_path(&path).await.unwrap();
+
+            for (i, (z, x, y)) in tiles.iter().enumerate() {
+                let coord = pmtiles::TileCoord::new(*z, *x, *y).unwrap();
+                // get_tile_decompressed strips the gzip wrapper the writer applied,
+                // so the returned bytes should be byte-identical to our raw payloads.
+                let got = reader.get_tile_decompressed(coord).await.unwrap()
+                    .unwrap_or_else(|| panic!("tile {z}/{x}/{y} missing"));
+                assert_eq!(got.as_ref(), payloads[i],
+                    "tile {z}/{x}/{y} content mismatch");
+            }
+        });
+    }
 }
