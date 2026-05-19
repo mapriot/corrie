@@ -682,6 +682,33 @@ mod tests {
     }
 
     #[test]
+    fn tile_id_matches_upstream_at_z14() {
+        // High-zoom spot check: tile-gen actually produces tiles at z=14 in
+        // corrie's contour use case, but our cross-validation above stops at
+        // z=8. Sample corners, CZ-area tiles, and a diagonal stripe.
+        use pmtiles::{TileCoord as PTCoord, TileId};
+        let z = 14u8;
+        let n = 1u32 << z; // 16384
+        let mut coords: Vec<(u32, u32)> = vec![
+            (0, 0), (n - 1, n - 1), (0, n - 1), (n - 1, 0),
+            (n / 2, n / 2),
+            (8718, 5544),  // near Jested (CZ)
+            (8650, 5510), (8949, 5599),  // CZ corners
+        ];
+        // Add a diagonal stripe at high zoom
+        for i in 0..16 {
+            let v = i * (n / 16);
+            coords.push((v, v));
+            coords.push((v, n - 1 - v));
+        }
+        for &(x, y) in &coords {
+            let ours = tile_id(z, x, y);
+            let theirs = TileId::from(PTCoord::new(z, x, y).unwrap()).value();
+            assert_eq!(ours, theirs, "z=14 mismatch at x={x}, y={y}: ours={ours}, theirs={theirs}");
+        }
+    }
+
+    #[test]
     fn directory_round_trip_single_entry() {
         let entries = vec![DirEntry { tile_id: 42, run_length: 1, offset: 0, length: 100 }];
         let bytes = serialize_directory(&entries);
