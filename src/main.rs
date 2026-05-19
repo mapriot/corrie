@@ -339,9 +339,18 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
 
     // Sequential write for now; parallelise in next task.
     let pb = indicatif::ProgressBar::new(tiles.len() as u64);
-    pb.set_style(indicatif::ProgressStyle::with_template(
-        "[{elapsed_precise}] {bar:45.cyan/blue} {pos:>6}/{len} tiles {per_sec} eta {eta}"
-    ).unwrap());
+    pb.set_style(
+        indicatif::ProgressStyle::with_template(
+            "[{elapsed_precise}] {bar:45.cyan/blue} {pos:>6}/{len} tiles  {tiles_per_sec}/s  eta {eta}",
+        )
+        .unwrap()
+        .with_key(
+            "tiles_per_sec",
+            |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                write!(w, "{}", state.per_sec() as u64).unwrap();
+            },
+        ),
+    );
 
     const CHUNK: usize = 4096;
 

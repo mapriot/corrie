@@ -9,7 +9,7 @@
 //! count.
 
 use anyhow::{Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
@@ -62,9 +62,18 @@ pub fn run(
     // phases look consistent. indicatif degrades cleanly to one line per
     // update when stderr is not a TTY (e.g. piped through `tee`).
     let pb = ProgressBar::new(parallel_inputs.len() as u64);
-    pb.set_style(ProgressStyle::with_template(
-        "[{elapsed_precise}] {bar:45.green/blue} {pos:>4}/{len} SHPs {per_sec} eta {eta}"
-    ).unwrap());
+    pb.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] {bar:45.green/blue} {pos:>4}/{len} SHPs  {shps_per_sec}/s  eta {eta}",
+        )
+        .unwrap()
+        .with_key(
+            "shps_per_sec",
+            |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                write!(w, "{}", state.per_sec() as u64).unwrap();
+            },
+        ),
+    );
 
     // `std::thread::scope` lets the reader thread borrow `parallel_inputs`
     // without 'static, and guarantees it joins before we exit the scope.
