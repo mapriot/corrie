@@ -14,15 +14,81 @@ const RIGHT:  u8 = 2;
 const BOTTOM: u8 = 4;
 const TOP:    u8 = 8;
 
+/// Cohen-Sutherland 4-bit outcode for a (x, y) vertex against `b`.
+/// Kept as the scalar entry point for `clip_segment_to_box`; the per-vertex
+/// hot loop in `clip_impl` uses [`outcode_vec`] which takes a packed
+/// `&[f64; 2]` and dispatches to NEON / SSE2 / branchless scalar.
 #[inline(always)]
 fn outcode(x: f64, y: f64, b: &Box2) -> u8 {
-    // Branchless: each side test becomes a single fcmp + cset; OR-combine
-    // with constant weights. Lets LLVM emit a flat dependency chain with
-    // no conditional branches inside the fused-loop body.
+    outcode_scalar(x, y, b)
+}
+
+#[inline(always)]
+fn outcode_scalar(x: f64, y: f64, b: &Box2) -> u8 {
     ((x < b.min_x) as u8) * LEFT
         | ((x > b.max_x) as u8) * RIGHT
         | ((y < b.min_y) as u8) * BOTTOM
         | ((y > b.max_y) as u8) * TOP
+}
+
+/// Outcode on a packed `[f64; 2]` vertex. NEON on aarch64, SSE2 on x86_64,
+/// branchless scalar elsewhere. All paths produce byte-identical results.
+#[inline(always)]
+fn outcode_vec(v: &[f64; 2], b: &Box2) -> u8 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe { outcode_neon(v, b) }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe { outcode_sse2(v, b) }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    outcode_scalar(v[0], v[1], b)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn outcode_neon(v: &[f64; 2], b: &Box2) -> u8 {
+    use std::arch::aarch64::*;
+    // Load vertex as (x, y), and the two box corners as (min_x, min_y)
+    // and (max_x, max_y) — two 2-lane f64 vectors each.
+    let p = vld1q_f64(v.as_ptr());
+    let bmin = vld1q_f64([b.min_x, b.min_y].as_ptr());
+    let bmax = vld1q_f64([b.max_x, b.max_y].as_ptr());
+    let lt = vcltq_f64(p, bmin); // lane 0: x<min_x mask;  lane 1: y<min_y mask
+    let gt = vcgtq_f64(p, bmax); // lane 0: x>max_x mask;  lane 1: y>max_y mask
+    // Each mask lane is 0 or u64::MAX. AND with the per-lane outcode weight
+    // gives 0 or weight. The two contributions are bit-disjoint, so
+    // horizontal sum across lanes == OR.
+    let wlt = vld1q_u64([LEFT as u64, BOTTOM as u64].as_ptr());
+    let wgt = vld1q_u64([RIGHT as u64, TOP as u64].as_ptr());
+    let combined = vorrq_u64(vandq_u64(lt, wlt), vandq_u64(gt, wgt));
+    vaddvq_u64(combined) as u8
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn outcode_sse2(v: &[f64; 2], b: &Box2) -> u8 {
+    use std::arch::x86_64::*;
+    // `_mm_set_pd(high, low)` packs lane 1 = high, lane 0 = low — so we
+    // want (lane 0 = x-bound, lane 1 = y-bound) to match the (x, y) layout
+    // of `p`. That means `_mm_set_pd(y_bound, x_bound)`.
+    let p = _mm_loadu_pd(v.as_ptr());
+    let bmin = _mm_set_pd(b.min_y, b.min_x);
+    let bmax = _mm_set_pd(b.max_y, b.max_x);
+    let lt = _mm_cmplt_pd(p, bmin); // 2-lane mask: (x<min_x, y<min_y)
+    let gt = _mm_cmpgt_pd(p, bmax); // 2-lane mask: (x>max_x, y>max_y)
+    let lt_bits = _mm_movemask_pd(lt) as u32; // bit 0 = x<min, bit 1 = y<min
+    let gt_bits = _mm_movemask_pd(gt) as u32; // bit 0 = x>max, bit 1 = y>max
+    // Pack into outcode bits:
+    //   LEFT   (bit 0) = lt_bits & 0b01
+    //   RIGHT  (bit 1) = (gt_bits & 0b01) << 1
+    //   BOTTOM (bit 2) = (lt_bits & 0b10) << 1
+    //   TOP    (bit 3) = (gt_bits & 0b10) << 2
+    let c = (lt_bits & 0b01)
+        | ((gt_bits & 0b01) << 1)
+        | ((lt_bits & 0b10) << 1)
+        | ((gt_bits & 0b10) << 2);
+    c as u8
 }
 
 /// Clip one segment to `b`. Returns the clipped endpoints, or None if the
@@ -107,11 +173,13 @@ pub fn clip_chain_spans_into(
     // in a register, eliminating the per-vertex Vec<u8> push (bounds-check +
     // length store) and the per-segment indexed outs[i] reads (bounds-check +
     // load) that dominated the prior implementation's CPU time on dense data.
-    let mut c_prev = outcode(coords[0][0], coords[0][1], clip_box);
+    // The outcode itself is computed via SIMD (NEON on aarch64, SSE2 on
+    // x86_64) directly on the packed [f64;2] vertex.
+    let mut c_prev = outcode_vec(&coords[0], clip_box);
     let mut chain_start: Option<usize> = None;
 
     for i in 1..coords.len() {
-        let c_curr = outcode(coords[i][0], coords[i][1], clip_box);
+        let c_curr = outcode_vec(&coords[i], clip_box);
         let intersects = if c_prev & c_curr != 0 {
             false
         } else if c_prev | c_curr == 0 {
