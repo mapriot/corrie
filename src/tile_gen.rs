@@ -228,7 +228,6 @@ pub fn process_tile(
                             && fb_min_latp >= min_latp
                             && fb_max_latp <= max_latp;
 
-            s.clip.outcodes.clear();
             s.clip.spans.clear();
             if fully_inside {
                 s.clip.spans.push((0, coords.len()));

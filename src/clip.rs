@@ -75,19 +75,17 @@ pub fn build_clip_chains(coords: &[[f64; 2]], clip_box: &Box2) -> Vec<Vec<[f64; 
         .collect()
 }
 
-/// Per-worker reusable scratch buffers for clip. Outcodes track one byte per
-/// polyline vertex; spans hold (start, end) half-open ranges into the source
-/// coords slice.
+/// Per-worker reusable scratch buffers for clip. `spans` holds (start, end)
+/// half-open ranges into the source coords slice.
 #[derive(Default)]
 pub struct ClipScratch {
-    pub outcodes: Vec<u8>,
     pub spans: Vec<(usize, usize)>,
 }
 
 /// Single-pass version that emits chains as half-open index spans into the
 /// original `coords` slice instead of cloning vertices into Vec<Vec<[f64;2]>>.
-/// `scratch.outcodes` and `scratch.spans` are cleared (length=0, capacity
-/// retained) at entry; on return, `scratch.spans` holds the produced chains.
+/// `scratch.spans` is cleared (length=0, capacity retained) at entry; on
+/// return, `scratch.spans` holds the produced chains.
 ///
 /// Semantics preserved from `build_clip_chains`:
 /// - Chain vertices are the ORIGINAL source vertices — `coords[start..end]`
@@ -101,39 +99,38 @@ pub fn clip_chain_spans_into(
     clip_box: &Box2,
     scratch: &mut ClipScratch,
 ) {
-    scratch.outcodes.clear();
     scratch.spans.clear();
     if coords.len() < 2 { return; }
 
-    scratch.outcodes.reserve(coords.len());
-    for v in coords {
-        scratch.outcodes.push(outcode(v[0], v[1], clip_box));
-    }
-    let outs = &scratch.outcodes;
-
+    // Fused outcode + chain-finding: hold only the previous vertex's outcode
+    // in a register, eliminating the per-vertex Vec<u8> push (bounds-check +
+    // length store) and the per-segment indexed outs[i] reads (bounds-check +
+    // load) that dominated the prior implementation's CPU time on dense data.
+    let mut c_prev = outcode(coords[0][0], coords[0][1], clip_box);
     let mut chain_start: Option<usize> = None;
-    for i in 0..coords.len() - 1 {
-        let c0 = outs[i];
-        let c1 = outs[i + 1];
-        let intersects = if c0 & c1 != 0 {
+
+    for i in 1..coords.len() {
+        let c_curr = outcode(coords[i][0], coords[i][1], clip_box);
+        let intersects = if c_prev & c_curr != 0 {
             false
-        } else if c0 | c1 == 0 {
+        } else if c_prev | c_curr == 0 {
             true
         } else {
             clip_segment_to_box(
+                (coords[i - 1][0], coords[i - 1][1]),
                 (coords[i][0], coords[i][1]),
-                (coords[i + 1][0], coords[i + 1][1]),
                 clip_box,
             ).is_some()
         };
         if intersects {
-            if chain_start.is_none() { chain_start = Some(i); }
+            if chain_start.is_none() { chain_start = Some(i - 1); }
         } else if let Some(s) = chain_start.take() {
-            // segment i-1 was the last intersecting; chain = coords[s..=i]
-            if i + 1 - s >= 2 {
-                scratch.spans.push((s, i + 1));
+            // last intersecting segment was (i-2, i-1); chain = coords[s..i]
+            if i - s >= 2 {
+                scratch.spans.push((s, i));
             }
         }
+        c_prev = c_curr;
     }
     if let Some(s) = chain_start.take() {
         let end = coords.len();
