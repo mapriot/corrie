@@ -96,3 +96,35 @@ fn chains_keep_polylines_entirely_inside() {
     assert_eq!(chains[0][0], [1.0, 1.0]);
     assert_eq!(chains[0][2], [3.0, 3.0]);
 }
+
+use corrie::clip::{clip_chain_spans_into, ClipScratch};
+
+#[test]
+fn spans_match_legacy_chains_random() {
+    // Compare the new span-based API against the legacy nested-Vec build_clip_chains
+    // on a battery of randomly-shaped polylines. They must produce the same chains.
+    fn rng(seed: &mut u64) -> f64 {
+        // tiny xorshift LCG for reproducibility
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        let bits = (*seed) & ((1u64 << 53) - 1);
+        bits as f64 / (1u64 << 53) as f64
+    }
+
+    let mut seed: u64 = 0x12345678abcd;
+    for trial in 0..100 {
+        let n = 3 + (trial % 30);
+        let pl: Vec<[f64; 2]> = (0..n)
+            .map(|_| [rng(&mut seed) * 20.0 - 5.0, rng(&mut seed) * 20.0 - 5.0])
+            .collect();
+        let chains_legacy = build_clip_chains(&pl, &B);
+        let mut scratch = ClipScratch::default();
+        clip_chain_spans_into(&pl, &B, &mut scratch);
+        let chains_new: Vec<Vec<[f64; 2]>> = scratch.spans.iter()
+            .map(|&(s, e)| pl[s..e].to_vec())
+            .collect();
+        assert_eq!(chains_legacy, chains_new,
+            "trial {trial}: legacy and span-based chains differ for polyline {:?}", pl);
+    }
+}

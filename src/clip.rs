@@ -68,24 +68,58 @@ pub fn clip_segment_to_box(
 /// slightly past the clip box at their endpoints — providing natural rendering
 /// overshoot. Chains with < 2 vertices are dropped.
 pub fn build_clip_chains(coords: &[[f64; 2]], clip_box: &Box2) -> Vec<Vec<[f64; 2]>> {
-    if coords.len() < 2 { return Vec::new(); }
-    // Precompute outcodes once per vertex — avoids redundant outcode
-    // evaluation that the windows(2)-based version did at every segment boundary.
-    let mut outs: Vec<u8> = Vec::with_capacity(coords.len());
+    let mut scratch = ClipScratch::default();
+    clip_chain_spans_into(coords, clip_box, &mut scratch);
+    scratch.spans.into_iter()
+        .map(|(s, e)| coords[s..e].to_vec())
+        .collect()
+}
+
+/// Per-worker reusable scratch buffers for clip. Outcodes track one byte per
+/// polyline vertex; spans hold (start, end) half-open ranges into the source
+/// coords slice.
+#[derive(Default)]
+pub struct ClipScratch {
+    pub outcodes: Vec<u8>,
+    pub spans: Vec<(usize, usize)>,
+}
+
+/// Single-pass version that emits chains as half-open index spans into the
+/// original `coords` slice instead of cloning vertices into Vec<Vec<[f64;2]>>.
+/// `scratch.outcodes` and `scratch.spans` are cleared (length=0, capacity
+/// retained) at entry; on return, `scratch.spans` holds the produced chains.
+///
+/// Semantics preserved from `build_clip_chains`:
+/// - Chain vertices are the ORIGINAL source vertices — `coords[start..end]`
+///   slices the raw polyline with no clipping applied at the boundary
+///   (natural rendering overshoot).
+/// - A chain is the maximal run of consecutive segments that have any
+///   intersection with clip_box.
+/// - Chains with < 2 vertices are dropped (never emitted in `spans`).
+pub fn clip_chain_spans_into(
+    coords: &[[f64; 2]],
+    clip_box: &Box2,
+    scratch: &mut ClipScratch,
+) {
+    scratch.outcodes.clear();
+    scratch.spans.clear();
+    if coords.len() < 2 { return; }
+
+    scratch.outcodes.reserve(coords.len());
     for v in coords {
-        outs.push(outcode(v[0], v[1], clip_box));
+        scratch.outcodes.push(outcode(v[0], v[1], clip_box));
     }
-    let mut chains: Vec<Vec<[f64; 2]>> = Vec::new();
-    let mut current: Vec<[f64; 2]> = Vec::new();
+    let outs = &scratch.outcodes;
+
+    let mut chain_start: Option<usize> = None;
     for i in 0..coords.len() - 1 {
         let c0 = outs[i];
         let c1 = outs[i + 1];
         let intersects = if c0 & c1 != 0 {
-            false  // trivial reject: both endpoints share an outside edge
+            false
         } else if c0 | c1 == 0 {
-            true   // trivial accept: both endpoints inside
+            true
         } else {
-            // Borderline — need actual segment test (we only care yes/no).
             clip_segment_to_box(
                 (coords[i][0], coords[i][1]),
                 (coords[i + 1][0], coords[i + 1][1]),
@@ -93,19 +127,20 @@ pub fn build_clip_chains(coords: &[[f64; 2]], clip_box: &Box2) -> Vec<Vec<[f64; 
             ).is_some()
         };
         if intersects {
-            if current.is_empty() {
-                current.push(coords[i]);
+            if chain_start.is_none() { chain_start = Some(i); }
+        } else if let Some(s) = chain_start.take() {
+            // segment i-1 was the last intersecting; chain = coords[s..=i]
+            if i + 1 - s >= 2 {
+                scratch.spans.push((s, i + 1));
             }
-            current.push(coords[i + 1]);
-        } else if current.len() >= 2 {
-            chains.push(std::mem::take(&mut current));
-            current.clear();
-        } else {
-            current.clear();
         }
     }
-    if current.len() >= 2 { chains.push(current); }
-    chains
+    if let Some(s) = chain_start.take() {
+        let end = coords.len();
+        if end - s >= 2 {
+            scratch.spans.push((s, end));
+        }
+    }
 }
 
 /// Clip a polyline to `b`, returning zero or more sub-polylines.

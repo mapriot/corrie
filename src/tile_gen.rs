@@ -81,7 +81,7 @@ pub fn hilbert_sort(tiles: &mut [TileCoord]) {
     tiles.sort_by_cached_key(|t| tile_id(t.z, t.x, t.y));
 }
 
-use crate::clip::{build_clip_chains, Box2};
+use crate::clip::{clip_chain_spans_into, ClipScratch, Box2};
 use crate::config::SourceLayer;
 use crate::feature_store::{FeatureRecord, Reader};
 use crate::mvt::{encode_tile, ContourFeature, EXTENT};
@@ -167,11 +167,7 @@ pub fn process_tile(
 
         let coords = reader.coords_of(rec);
 
-        // Fast path: if the feature's stored f32 bbox (expanded by slack to
-        // cover possible f32 rounding) sits comfortably inside the tile's
-        // f64 clip box, we know clipping would emit one chain == the whole
-        // polyline. Skip outcode pass entirely. Significant at z=14 where
-        // contour features are short and mostly fall inside a single tile.
+        // Fast path: see Task 2 comment.
         let fb_min_lon  = fb.min[0] as f64 - F32_BBOX_SLACK;
         let fb_max_lon  = fb.max[0] as f64 + F32_BBOX_SLACK;
         let fb_min_latp = fb.min[1] as f64 - F32_BBOX_SLACK;
@@ -181,12 +177,17 @@ pub fn process_tile(
                         && fb_min_latp >= min_latp
                         && fb_max_latp <= max_latp;
 
-        let chains: Vec<Vec<[f64; 2]>> = if fully_inside {
-            vec![coords.to_vec()]
+        // Compute chain spans into a per-call scratch buffer. Task 5 will
+        // hoist this into a thread_local so it persists across tiles.
+        let mut clip_scratch = ClipScratch::default();
+        if fully_inside {
+            clip_scratch.spans.push((0, coords.len()));
         } else {
-            build_clip_chains(coords, &clip)
-        };
-        for chain in chains {
+            clip_chain_spans_into(coords, &clip, &mut clip_scratch);
+        }
+
+        for &(start, end) in &clip_scratch.spans {
+            let chain = &coords[start..end];
             // Simplify in (lon, latp) degp space. eps is always > 0 because of
             // the sub-pixel floor, so we always run DP.
             let pts: Vec<(f64, f64)> = chain.iter().map(|p| (p[0], p[1])).collect();
