@@ -177,6 +177,10 @@ pub fn process_tile(
         let clip = Box2 { min_x: min_lon, min_y: min_latp, max_x: max_lon, max_y: max_latp };
         let xscale = (max_lon - min_lon) / EXTENT as f64;
         let yscale = (max_latp - min_latp) / EXTENT as f64;
+        // Reciprocals for the quantize hot loop — multiply is 3-5× cheaper
+        // than divide on arm64 and the loop runs per-vertex per-feature per-tile.
+        let inv_xscale = 1.0 / xscale;
+        let inv_yscale = 1.0 / yscale;
         let subpixel_eps = 0.5 * xscale;
 
         // R-tree query — stream directly, no Vec<&FeatureBbox> materialisation.
@@ -255,8 +259,8 @@ pub fn process_tile(
                 // Quantize into a fresh Vec (will be moved into groups).
                 let mut points: Vec<(i32, i32)> = Vec::with_capacity(s.simplified.len());
                 for &(lon, latp) in &s.simplified {
-                    let px = ((lon - min_lon) / xscale).floor() as i32;
-                    let py = ((max_latp - latp) / yscale).floor() as i32;
+                    let px = ((lon - min_lon) * inv_xscale).floor() as i32;
+                    let py = ((max_latp - latp) * inv_yscale).floor() as i32;
                     if let Some(&last) = points.last() {
                         if last == (px, py) { continue; }
                     }
