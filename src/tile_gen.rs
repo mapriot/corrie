@@ -32,6 +32,14 @@ use crate::mercator::{lat2latp, tilex2lon, tiley2latp};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TileCoord { pub z: u8, pub x: u32, pub y: u32 }
 
+/// Slack on the f32 feature bbox when testing "fully inside tile". The feature
+/// bbox is stored in f32 (FeatureRecord) and can underestimate the true f64
+/// bbox by up to half a ULP. Worst-case ULP at lon=180 is ~2.1e-5 degrees;
+/// 5e-5 gives a safe margin while still capturing the vast majority of
+/// features at z=14 (tile width ~0.022° at z=14, so we lose the fast path
+/// only for features within ~5.5 m of a tile boundary).
+const F32_BBOX_SLACK: f64 = 5e-5;
+
 /// All tiles at zooms `[zmin..=zmax]` whose extent intersects `bbox`.
 /// `bbox = [min_lon, min_lat, max_lon, max_lat]` in WGS84 degrees.
 pub fn enumerate_tiles(bbox: [f64; 4], zmin: u8, zmax: u8) -> Vec<TileCoord> {
@@ -159,9 +167,25 @@ pub fn process_tile(
 
         let coords = reader.coords_of(rec);
 
-        // Split into chains: maximal runs of segments intersecting the clip box.
-        // Chain vertices are original source coordinates (natural overshoot).
-        let chains = build_clip_chains(coords, &clip);
+        // Fast path: if the feature's stored f32 bbox (expanded by slack to
+        // cover possible f32 rounding) sits comfortably inside the tile's
+        // f64 clip box, we know clipping would emit one chain == the whole
+        // polyline. Skip outcode pass entirely. Significant at z=14 where
+        // contour features are short and mostly fall inside a single tile.
+        let fb_min_lon  = fb.min[0] as f64 - F32_BBOX_SLACK;
+        let fb_max_lon  = fb.max[0] as f64 + F32_BBOX_SLACK;
+        let fb_min_latp = fb.min[1] as f64 - F32_BBOX_SLACK;
+        let fb_max_latp = fb.max[1] as f64 + F32_BBOX_SLACK;
+        let fully_inside = fb_min_lon  >= min_lon
+                        && fb_max_lon  <= max_lon
+                        && fb_min_latp >= min_latp
+                        && fb_max_latp <= max_latp;
+
+        let chains: Vec<Vec<[f64; 2]>> = if fully_inside {
+            vec![coords.to_vec()]
+        } else {
+            build_clip_chains(coords, &clip)
+        };
         for chain in chains {
             // Simplify in (lon, latp) degp space. eps is always > 0 because of
             // the sub-pixel floor, so we always run DP.
