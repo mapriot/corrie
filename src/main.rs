@@ -338,7 +338,10 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
         (w, s, e, n), &output_layer, "elevation", tiles.len() as u64,
     )?;
 
-    // Sequential write for now; parallelise in next task.
+    // Parallel tile-gen via rayon, serial write through the PMTiles writer
+    // (the writer's clustered=true layout requires monotonically increasing
+    // tile_id, so we collect each chunk's results and add_tile them in
+    // Hilbert order).
     let pb = indicatif::ProgressBar::new(tiles.len() as u64);
     pb.set_style(
         indicatif::ProgressStyle::with_template(

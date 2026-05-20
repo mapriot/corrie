@@ -67,8 +67,6 @@ pub fn enumerate_tiles(bbox: [f64; 4], zmin: u8, zmax: u8) -> Vec<TileCoord> {
                 out.push(TileCoord { z, x, y });
             }
         }
-        // Silence unused warning while keeping the helper expressive.
-        let _ = tilex2lon(0, z);
     }
     out
 }
@@ -217,7 +215,10 @@ pub fn process_tile(
 
             let coords = reader.coords_of(rec);
 
-            // Fast path: feature fully inside tile (see Task 2 comment).
+            // Fast path: if the feature's stored f32 bbox (expanded by
+            // F32_BBOX_SLACK to absorb f32 rounding) sits inside the tile's
+            // f64 clip box, clipping would emit a single chain == whole
+            // polyline. Skip the outcode pass entirely.
             let fb_min_lon  = fb.min[0] as f64 - F32_BBOX_SLACK;
             let fb_max_lon  = fb.max[0] as f64 + F32_BBOX_SLACK;
             let fb_min_latp = fb.min[1] as f64 - F32_BBOX_SLACK;
@@ -289,6 +290,3 @@ pub fn process_tile(
         Some(mvt)
     })
 }
-
-// Suppress unused-import warning if lat2latp isn't used yet.
-const _: fn(f64) -> f64 = lat2latp;
