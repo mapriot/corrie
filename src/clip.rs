@@ -14,14 +14,15 @@ const RIGHT:  u8 = 2;
 const BOTTOM: u8 = 4;
 const TOP:    u8 = 8;
 
-#[inline]
+#[inline(always)]
 fn outcode(x: f64, y: f64, b: &Box2) -> u8 {
-    let mut c = INSIDE;
-    if x < b.min_x { c |= LEFT; }
-    else if x > b.max_x { c |= RIGHT; }
-    if y < b.min_y { c |= BOTTOM; }
-    else if y > b.max_y { c |= TOP; }
-    c
+    // Branchless: each side test becomes a single fcmp + cset; OR-combine
+    // with constant weights. Lets LLVM emit a flat dependency chain with
+    // no conditional branches inside the fused-loop body.
+    ((x < b.min_x) as u8) * LEFT
+        | ((x > b.max_x) as u8) * RIGHT
+        | ((y < b.min_y) as u8) * BOTTOM
+        | ((y > b.max_y) as u8) * TOP
 }
 
 /// Clip one segment to `b`. Returns the clipped endpoints, or None if the
