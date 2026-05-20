@@ -69,26 +69,42 @@ pub fn clip_segment_to_box(
 /// overshoot. Chains with < 2 vertices are dropped.
 pub fn build_clip_chains(coords: &[[f64; 2]], clip_box: &Box2) -> Vec<Vec<[f64; 2]>> {
     if coords.len() < 2 { return Vec::new(); }
+    // Precompute outcodes once per vertex — avoids redundant outcode
+    // evaluation that the windows(2)-based version did at every segment boundary.
+    let mut outs: Vec<u8> = Vec::with_capacity(coords.len());
+    for v in coords {
+        outs.push(outcode(v[0], v[1], clip_box));
+    }
     let mut chains: Vec<Vec<[f64; 2]>> = Vec::new();
     let mut current: Vec<[f64; 2]> = Vec::new();
-    for w in coords.windows(2) {
-        let a = [w[0][0], w[0][1]];
-        let b = [w[1][0], w[1][1]];
-        if clip_segment_to_box((a[0], a[1]), (b[0], b[1]), clip_box).is_some() {
-            if current.is_empty() {
-                current.push(a);
-            }
-            current.push(b);
+    for i in 0..coords.len() - 1 {
+        let c0 = outs[i];
+        let c1 = outs[i + 1];
+        let intersects = if c0 & c1 != 0 {
+            false  // trivial reject: both endpoints share an outside edge
+        } else if c0 | c1 == 0 {
+            true   // trivial accept: both endpoints inside
         } else {
-            if current.len() >= 2 {
-                chains.push(std::mem::take(&mut current));
+            // Borderline — need actual segment test (we only care yes/no).
+            clip_segment_to_box(
+                (coords[i][0], coords[i][1]),
+                (coords[i + 1][0], coords[i + 1][1]),
+                clip_box,
+            ).is_some()
+        };
+        if intersects {
+            if current.is_empty() {
+                current.push(coords[i]);
             }
+            current.push(coords[i + 1]);
+        } else if current.len() >= 2 {
+            chains.push(std::mem::take(&mut current));
+            current.clear();
+        } else {
             current.clear();
         }
     }
-    if current.len() >= 2 {
-        chains.push(current);
-    }
+    if current.len() >= 2 { chains.push(current); }
     chains
 }
 
