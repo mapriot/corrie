@@ -1,16 +1,30 @@
-//! Phase 1 driver: stream SHPs (parallel readers), apply attribute rules,
-//! write features.bin + coords.bin + rtree.bin + manifest.bin.
+//! Phase 1 driver: parallel-read SHPs, ordered-write to feature store.
+//! Produces `features.bin` + `coords.bin` + `rtree.bin` + `manifest.bin`.
 //!
-//! Memory model: features are never accumulated in RAM. Reader threads parse
-//! one SHP each in parallel and push features over a bounded channel; the
-//! main thread is the sole writer to the on-disk builder. Peak RAM is
-//! bounded by the channel buffer + the R-tree bbox vec (24 B/feature), so
-//! ingest of a 30M-feature planet uses ~1 GB regardless of total vertex
-//! count.
+//! Concurrency model: rayon parallel-iterates SHPs across all available
+//! workers; each worker reads its SHP into a per-SHP `Vec<ReadFeature>`
+//! buffer (no streaming inside an SHP) and sends the whole buffer as a
+//! single `ShpResult` message. The writer (main thread) drains pending
+//! results from a small `BTreeMap`, pulling the next-expected SHP index
+//! whenever it becomes available and appending its features to the
+//! on-disk builder in order.
+//!
+//! Memory model: peak RAM during ingest is bounded by `(num_workers +
+//! pending) × max_shp_features × per-feature-bytes`. For the mapriot
+//! planet dataset the worst case is a few tens of GB transiently — well
+//! under the prod-box 100 GB cgroup. Steady-state RAM is the R-tree bbox
+//! vec only (~24 B/feature).
+//!
+//! Ordering is deterministic: SHPs are appended to features.bin/coords.bin
+//! in config order, regardless of which reader worker finished first.
+//! Features within an SHP arrive in shapefile-file order from the GDAL
+//! reader. The resulting feature store and R-tree are byte-reproducible
+//! across runs of the same binary on the same inputs.
 
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use rayon::prelude::*;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
 
@@ -25,10 +39,12 @@ pub struct IngestStats {
     pub vertices: u64,
 }
 
-/// Per-feature payload sent over the reader→writer channel.
-struct StreamItem {
-    layer_id: u16,
-    feature: ReadFeature,
+/// One reader worker's complete output: all features parsed from one SHP.
+/// Sent as a single message so the writer can drain SHPs atomically in
+/// config order without per-feature tagging.
+struct ShpResult {
+    shp_index: u16,
+    features: Vec<(ReadFeature, u16)>, // (feature, layer_id)
 }
 
 /// Stream all SHPs in parallel, write the feature store on a single writer.
@@ -49,9 +65,11 @@ pub fn run(
         })
         .collect();
 
-    // Bounded channel — backpressures readers when the writer is slow. 4096
-    // slots is a few MB of features in flight; tuned for SSD write throughput.
-    let (tx, rx) = sync_channel::<StreamItem>(4096);
+    // Bounded channel — one slot per worker plus a small buffer. Each
+    // message is an entire SHP's features (potentially hundreds of MB),
+    // so we don't want many in flight.
+    let chan_cap = (rayon::current_num_threads() + 2).max(2);
+    let (tx, rx) = sync_channel::<ShpResult>(chan_cap);
 
     let mut builder = Builder::create(cache_dir)?;
     let mut bbox_entries: Vec<FeatureBbox> = Vec::new();
@@ -75,43 +93,68 @@ pub fn run(
         ),
     );
 
-    // `std::thread::scope` lets the reader thread borrow `parallel_inputs`
-    // without 'static, and guarantees it joins before we exit the scope.
+    // `std::thread::scope` lets the reader pool borrow `parallel_inputs`
+    // without 'static, and guarantees workers join before we exit the scope.
     let read_result: Result<()> = std::thread::scope(|scope| {
-        // Spawn one reader-coordinator thread; inside it, rayon parallelises
-        // across SHPs. Each emit sends one feature through the bounded channel.
+        // Spawn one coordinator thread; inside it, rayon par_iter's across
+        // SHPs. Each worker reads its SHP fully, packs all features into a
+        // single Vec, and sends one ShpResult tagged with the SHP index.
         let inputs_ref = &parallel_inputs;
         let pb_ref = &pb;
         let read_handle = scope.spawn(move || -> Result<()> {
-            inputs_ref.par_iter().try_for_each(|(lid, s, col)| -> Result<()> {
+            inputs_ref.par_iter().enumerate().try_for_each(|(i, (lid, s, col))| -> Result<()> {
                 let lid = *lid;
-                let tx = tx.clone();
+                let shp_idx = i as u16;
+                let mut shp_features: Vec<(ReadFeature, u16)> = Vec::new();
                 read_polylines_streaming(&s.shp_path, col, |feature| {
-                    tx.send(StreamItem { layer_id: lid, feature })
-                        .map_err(|_| anyhow::anyhow!("writer thread terminated"))
+                    shp_features.push((feature, lid));
+                    Ok(())
                 }).with_context(|| format!("read {:?}", s.shp_path))?;
+                tx.send(ShpResult { shp_index: shp_idx, features: shp_features })
+                    .map_err(|_| anyhow::anyhow!("writer thread terminated"))?;
                 pb_ref.inc(1);
                 Ok(())
             })?;
-            // Drop the last `tx` clone here so the channel closes when all
-            // readers are done.
+            // Drop `tx` so the channel closes once all readers are done.
             drop(tx);
             Ok(())
         });
 
-        // Main thread is the writer. Drain the channel one feature at a time;
-        // append to coords.bin + features.bin and collect bbox entries for
-        // the R-tree.
-        while let Ok(item) = rx.recv() {
-            let f = item.feature;
-            let (minzoom, flags) = derive_attributes(f.elevation as i32);
-            builder.add_feature(&f.coords, f.elevation, minzoom, flags, item.layer_id)?;
-            bbox_entries.push(FeatureBbox {
-                idx,
-                min: [f.bbox_min_lon as f32, f.bbox_min_latp as f32],
-                max: [f.bbox_max_lon as f32, f.bbox_max_latp as f32],
-            });
-            idx = idx.checked_add(1).context("feature count exceeds u32::MAX")?;
+        // Main thread is the writer. Drain results in SHP-config order via a
+        // BTreeMap that always exposes the smallest pending key, while
+        // accepting messages in arrival order.
+        let total_shps = inputs_ref.len();
+        let mut pending: BTreeMap<u16, Vec<(ReadFeature, u16)>> = BTreeMap::new();
+        let mut next_expected: u16 = 0;
+
+        while (next_expected as usize) < total_shps {
+            // Drain whatever is ready in order.
+            while pending.get(&next_expected).is_some() {
+                let features = pending.remove(&next_expected).unwrap();
+                for (f, lid) in features {
+                    let (minzoom, flags) = derive_attributes(f.elevation as i32);
+                    builder.add_feature(&f.coords, f.elevation, minzoom, flags, lid)?;
+                    bbox_entries.push(FeatureBbox {
+                        idx,
+                        min: [f.bbox_min_lon as f32, f.bbox_min_latp as f32],
+                        max: [f.bbox_max_lon as f32, f.bbox_max_latp as f32],
+                    });
+                    idx = idx.checked_add(1).context("feature count exceeds u32::MAX")?;
+                }
+                next_expected += 1;
+            }
+            if (next_expected as usize) >= total_shps { break; }
+
+            // Wait for another worker to deliver an SHP.
+            match rx.recv() {
+                Ok(result) => { pending.insert(result.shp_index, result.features); }
+                Err(_) => {
+                    // Channel closed before SHP next_expected arrived. Means
+                    // a reader errored out; the par_iter Err will surface via
+                    // read_handle.join() below.
+                    break;
+                }
+            }
         }
 
         // Surface any error from the reader pool (also catches the case where
