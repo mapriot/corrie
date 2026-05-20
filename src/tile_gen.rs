@@ -29,7 +29,7 @@ pub fn tile_eps_degp(
 
 use crate::mercator::{lat2latp, tilex2lon, tiley2latp};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TileCoord { pub z: u8, pub x: u32, pub y: u32 }
 
 /// Slack on the f32 feature bbox when testing "fully inside tile". The feature
@@ -71,6 +71,53 @@ pub fn enumerate_tiles(bbox: [f64; 4], zmin: u8, zmax: u8) -> Vec<TileCoord> {
         let _ = tilex2lon(0, z);
     }
     out
+}
+
+/// Same set of tiles as `enumerate_tiles` would produce, minus every (z,x,y)
+/// whose extent contains no feature in `rtree`. Walks the tile space as a
+/// quadtree: probe each tile with `contains_any`; if empty, prune its entire
+/// subtree (4^(zmax-z) tiles skipped for free).
+///
+/// `bbox = [min_lon, min_lat, max_lon, max_lat]` in WGS84 degrees. zmin/zmax
+/// inclusive on both ends.
+pub fn enumerate_tiles_pruned(
+    rtree: &rstar::RTree<crate::spatial_index::FeatureBbox>,
+    bbox: [f64; 4],
+    zmin: u8,
+    zmax: u8,
+) -> Vec<TileCoord> {
+    // Start with all tiles at zmin intersecting bbox — reuse the existing
+    // single-zoom enumeration to avoid duplicating bbox→tile math.
+    let mut stack: Vec<TileCoord> = enumerate_tiles(bbox, zmin, zmin);
+    let mut out: Vec<TileCoord> = Vec::new();
+
+    while let Some(t) = stack.pop() {
+        let bb = tile_to_aabb_f32(t);
+        if !crate::spatial_index::contains_any(rtree, bb) {
+            continue;
+        }
+        out.push(t);
+        if t.z < zmax {
+            let cx = t.x * 2;
+            let cy = t.y * 2;
+            stack.push(TileCoord { z: t.z + 1, x: cx,     y: cy });
+            stack.push(TileCoord { z: t.z + 1, x: cx + 1, y: cy });
+            stack.push(TileCoord { z: t.z + 1, x: cx,     y: cy + 1 });
+            stack.push(TileCoord { z: t.z + 1, x: cx + 1, y: cy + 1 });
+        }
+    }
+    out
+}
+
+fn tile_to_aabb_f32(t: TileCoord) -> rstar::AABB<[f32; 2]> {
+    let min_lon  = tilex2lon(t.x, t.z);
+    let max_lon  = tilex2lon(t.x + 1, t.z);
+    let max_latp = tiley2latp(t.y, t.z);
+    let min_latp = tiley2latp(t.y + 1, t.z);
+    rstar::AABB::from_corners(
+        [min_lon as f32, min_latp as f32],
+        [max_lon as f32, max_latp as f32],
+    )
 }
 
 /// In-place Hilbert-curve ordering. PMTiles requires directory entries to

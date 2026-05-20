@@ -64,3 +64,10 @@ pub fn rtree_bbox(tree: &RTree<FeatureBbox>) -> Option<(f64, f64, f64, f64)> {
     let hi = env.upper();
     Some((lo[0] as f64, lo[1] as f64, hi[0] as f64, hi[1] as f64))
 }
+
+/// Single-probe "is any feature in this envelope?". Faster than `query_rtree`
+/// because it doesn't materialise a Vec — `Iterator::next().is_some()`
+/// short-circuits on the first hit.
+pub fn contains_any(tree: &RTree<FeatureBbox>, query: AABB<[f32; 2]>) -> bool {
+    tree.locate_in_envelope_intersecting(&query).next().is_some()
+}

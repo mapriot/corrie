@@ -239,7 +239,7 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
     use corrie::ingest;
     use corrie::feature_store::{Reader, cache_valid};
     use corrie::spatial_index::load_rtree;
-    use corrie::tile_gen::{enumerate_tiles, hilbert_sort, process_tile};
+    use corrie::tile_gen::{hilbert_sort, process_tile};
     use corrie::container::pmtiles::PmtilesWriter;
 
     if let Some(w) = args.workers {
@@ -323,8 +323,9 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
             [0.0, 0.0, 0.0, 0.0]
         }
     };
-    let mut tiles = enumerate_tiles(bbox, cfg.settings.minzoom, cfg.settings.maxzoom);
-    eprintln!("{} tiles to process", tiles.len());
+    use corrie::tile_gen::enumerate_tiles_pruned;
+    let mut tiles = enumerate_tiles_pruned(&rtree, bbox, cfg.settings.minzoom, cfg.settings.maxzoom);
+    eprintln!("{} tiles to process (quadtree-pruned)", tiles.len());
     hilbert_sort(&mut tiles);
 
     // PMTiles writer.

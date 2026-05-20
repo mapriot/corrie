@@ -72,3 +72,37 @@ fn hilbert_sort_is_deterministic_and_orders_by_id() {
     hilbert_sort(&mut tiles);
     assert_eq!(tiles, snap);
 }
+
+use corrie::tile_gen::enumerate_tiles_pruned;
+use corrie::spatial_index::{build_rtree, FeatureBbox};
+
+#[test]
+fn pruned_subset_of_unpruned() {
+    // Place one feature bbox in roughly the Prague tile area at z=11.
+    let boxes = vec![FeatureBbox {
+        idx: 0,
+        min: [14.3_f32, corrie::mercator::lat2latp(50.0) as f32],
+        max: [14.5_f32, corrie::mercator::lat2latp(50.1) as f32],
+    }];
+    let rtree = build_rtree(boxes);
+    let bbox = [14.0, 49.9, 14.6, 50.2];
+    let unpruned = enumerate_tiles(bbox, 11, 13);
+    let pruned   = enumerate_tiles_pruned(&rtree, bbox, 11, 13);
+
+    use std::collections::HashSet;
+    let u: HashSet<_> = unpruned.iter().copied().collect();
+    let p: HashSet<_> = pruned.iter().copied().collect();
+    assert!(p.is_subset(&u), "pruned must be a subset of unpruned");
+    assert!(!p.is_empty(), "pruned must keep at least the covering tiles");
+    // The single small feature shouldn't pull in the whole z=13 bbox.
+    assert!(p.len() < u.len(),
+        "pruning must remove at least one tile (got pruned={}, unpruned={})",
+        p.len(), u.len());
+}
+
+#[test]
+fn pruned_world_with_no_features_is_empty() {
+    let rtree = build_rtree(Vec::<FeatureBbox>::new());
+    let tiles = enumerate_tiles_pruned(&rtree, [-180.0, -85.0, 180.0, 85.0], 0, 5);
+    assert!(tiles.is_empty(), "empty tree must yield zero tiles");
+}
