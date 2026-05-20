@@ -290,6 +290,20 @@ fn gzip(input: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(enc.finish()?)
 }
 
+/// Faster gzip for per-tile MVT compression. Level 3 instead of default 6
+/// (~50% compression CPU reduction for ~3-5% output-size growth). Used
+/// exclusively for tile MVTs at add_tile time; leaf/root directories and
+/// metadata still use the default level via `gzip`, since they're written
+/// once at finalize and file-size matters more than CPU there.
+fn gzip_tile(input: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut enc = GzEncoder::new(Vec::with_capacity(input.len() / 2), Compression::new(3));
+    enc.write_all(input)?;
+    Ok(enc.finish()?)
+}
+
 // ---------------- PmtilesWriter ----------------
 
 use std::fs::File;
@@ -418,7 +432,7 @@ impl PmtilesWriter {
         }
         self.last_tile_id = Some(id);
 
-        let gz = gzip(mvt_raw).context("gzip tile MVT")?;
+        let gz = gzip_tile(mvt_raw).context("gzip tile MVT")?;
         let offset_in_section = self.next_tile_offset - self.tile_data_section_start;
 
         // Seek to the absolute tile-data position before writing.
