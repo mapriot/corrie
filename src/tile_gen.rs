@@ -85,7 +85,7 @@ use crate::clip::{clip_chain_spans_into, ClipScratch, Box2};
 use crate::config::SourceLayer;
 use crate::feature_store::{FeatureRecord, Reader};
 use crate::mvt::{encode_tile, ContourFeature, EXTENT};
-use crate::simplify::simplify;
+use crate::simplify::simplify_into;
 use crate::spatial_index::{query_rtree, FeatureBbox};
 use rstar::{RTree, AABB};
 
@@ -190,8 +190,15 @@ pub fn process_tile(
             let chain = &coords[start..end];
             // Simplify in (lon, latp) degp space. eps is always > 0 because of
             // the sub-pixel floor, so we always run DP.
-            let pts: Vec<(f64, f64)> = chain.iter().map(|p| (p[0], p[1])).collect();
-            let simplified: Vec<(f64, f64)> = simplify(&pts, eps);
+            // Convert chain slice to (f64, f64) tuple form for simplify_into.
+            // Task 5 will hoist `pts`, `simplified`, dp_stack, dp_kept into a
+            // thread_local TileScratch; for this commit they are per-call.
+            let mut pts: Vec<(f64, f64)> = Vec::with_capacity(chain.len());
+            for p in chain { pts.push((p[0], p[1])); }
+            let mut dp_stack: Vec<(usize, usize)> = Vec::new();
+            let mut dp_kept: Vec<bool> = Vec::new();
+            let mut simplified: Vec<(f64, f64)> = Vec::new();
+            simplify_into(&pts, eps, &mut dp_stack, &mut dp_kept, &mut simplified);
             if simplified.len() < 2 { continue; }
 
             // Quantize to MVT extent (px, py), drop consecutive duplicates.
