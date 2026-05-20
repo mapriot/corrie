@@ -81,13 +81,33 @@ pub fn hilbert_sort(tiles: &mut [TileCoord]) {
     tiles.sort_by_cached_key(|t| tile_id(t.z, t.x, t.y));
 }
 
-use crate::clip::{clip_chain_spans_into, ClipScratch, Box2};
+use crate::clip::{clip_chain_spans_into, Box2};
 use crate::config::SourceLayer;
 use crate::feature_store::{FeatureRecord, Reader};
 use crate::mvt::{encode_tile, ContourFeature, EXTENT};
 use crate::simplify::simplify_into;
-use crate::spatial_index::{query_rtree, FeatureBbox};
+use crate::spatial_index::FeatureBbox;
 use rstar::{RTree, AABB};
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+/// Per-worker reusable scratch buffers. Each rayon worker keeps one of these
+/// in a thread_local; process_tile borrows it for the whole call and clears
+/// the length (capacity retained) between tiles.
+#[derive(Default)]
+struct TileScratch {
+    clip: crate::clip::ClipScratch,
+    pts_f64: Vec<(f64, f64)>,
+    simplified: Vec<(f64, f64)>,
+    dp_stack: Vec<(usize, usize)>,
+    dp_kept: Vec<bool>,
+    eps_cache: Vec<Option<f64>>,
+    groups: HashMap<(i16, u8), Vec<Vec<(i32, i32)>>>,
+}
+
+thread_local! {
+    static SCRATCH: RefCell<TileScratch> = RefCell::new(TileScratch::default());
+}
 
 /// Per-tile output: raw MVT bytes (uncompressed), or None if empty.
 /// The pmtiles writer applies gzip compression automatically for MVT tiles.
@@ -99,143 +119,128 @@ pub fn process_tile(
     output_layer_name: &str,
     elevation_attr: &str,
 ) -> Option<Vec<u8>> {
-    let z = tile.z;
+    SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        let s = &mut *s;
 
-    // Tile bounds in (lon, latp).
-    let min_lon  = tilex2lon(tile.x, z);
-    let max_lon  = tilex2lon(tile.x + 1, z);
-    let max_latp = tiley2latp(tile.y, z);
-    let min_latp = tiley2latp(tile.y + 1, z);
-    let tile_centre_latp = (min_latp + max_latp) * 0.5;
+        let z = tile.z;
+        let min_lon  = tilex2lon(tile.x, z);
+        let max_lon  = tilex2lon(tile.x + 1, z);
+        let max_latp = tiley2latp(tile.y, z);
+        let min_latp = tiley2latp(tile.y + 1, z);
+        let tile_centre_latp = (min_latp + max_latp) * 0.5;
+        let clip = Box2 { min_x: min_lon, min_y: min_latp, max_x: max_lon, max_y: max_latp };
+        let xscale = (max_lon - min_lon) / EXTENT as f64;
+        let yscale = (max_latp - min_latp) / EXTENT as f64;
+        let subpixel_eps = 0.5 * xscale;
 
-    let clip = Box2 { min_x: min_lon, min_y: min_latp, max_x: max_lon, max_y: max_latp };
+        // R-tree query — stream directly, no Vec<&FeatureBbox> materialisation.
+        let query = AABB::from_corners([min_lon as f32, min_latp as f32], [max_lon as f32, max_latp as f32]);
+        let mut any_hits = false;
 
-    // Quantization scales.
-    let xscale = (max_lon - min_lon) / EXTENT as f64;
-    let yscale = (max_latp - min_latp) / EXTENT as f64;
+        // Reset per-tile scratch (length=0, capacity retained).
+        s.eps_cache.clear();
+        s.eps_cache.resize(sources.len(), None);
+        s.groups.clear();
 
-    // Sub-pixel simplification floor: even when the source layer doesn't simplify
-    // at this zoom (e.g. z >= simplify_below), removing vertices that lie within
-    // half an MVT pixel of the chord between their neighbours has no visual
-    // effect — they all quantise to the same pixel — and saves real bytes.
-    // xscale == yscale in (lon, latp) space because tile y is linear in latp.
-    let subpixel_eps = 0.5 * xscale;
+        let feature_recs: &[FeatureRecord] = reader.features();
 
-    // R-tree query: use the exact tile clip box so only features whose bbox
-    // intersects the actual tile are included.
-    let query = AABB::from_corners([min_lon as f32, min_latp as f32], [max_lon as f32, max_latp as f32]);
-    let hits: Vec<&FeatureBbox> = query_rtree(rtree, query);
-    if hits.is_empty() { return None; }
+        for fb in rtree.locate_in_envelope_intersecting(&query) {
+            any_hits = true;
+            let rec = &feature_recs[fb.idx as usize];
+            let rec_layer_id = rec.layer_id;
+            let rec_minzoom = rec.minzoom;
+            let rec_elevation = rec.elevation;
+            let rec_flags = rec.flags;
 
-    // Per source-layer eps cache (one per unique simplify config encountered).
-    let mut eps_cache: Vec<Option<f64>> = vec![None; sources.len()];
+            let src = &sources[rec_layer_id as usize];
+            if z < src.minzoom || z > src.maxzoom { continue; }
+            if rec_minzoom > z { continue; }
 
-    // Group sub-linestrings by (elevation, flags) — all features in this tile
-    // sharing the same attributes are packed into one MVT MultiLineString
-    // feature. This dramatically reduces tile size for dense contour data
-    // (each feature shares one tag table entry instead of one per sub-line).
-    use std::collections::HashMap;
-    let mut groups: HashMap<(i16, u8), Vec<Vec<(i32, i32)>>> = HashMap::new();
-    let feature_recs: &[FeatureRecord] = reader.features();
-
-    for fb in hits {
-        let rec = &feature_recs[fb.idx as usize];
-        // Layer-level minzoom/maxzoom gate.
-        // CRITICAL: rec is from mmap of a `packed(4)` struct. Copy fields by value.
-        let rec_layer_id = rec.layer_id;
-        let rec_minzoom = rec.minzoom;
-        let rec_elevation = rec.elevation;
-        let rec_flags = rec.flags;
-
-        let s = &sources[rec_layer_id as usize];
-        if z < s.minzoom || z > s.maxzoom { continue; }
-        // Per-feature minzoom gate.
-        if rec_minzoom > z { continue; }
-
-        // Compute / cache eps. Floor at half a pixel — anything finer collapses
-        // to a single MVT pixel after quantisation anyway.
-        let eps = match eps_cache[rec_layer_id as usize] {
-            Some(v) => v,
-            None => {
-                let v = tile_eps_degp(
-                    z, s.simplify_below, s.simplify_level, s.simplify_length,
-                    s.simplify_ratio, tile_centre_latp).max(subpixel_eps);
-                eps_cache[rec_layer_id as usize] = Some(v);
-                v
-            }
-        };
-
-        let coords = reader.coords_of(rec);
-
-        // Fast path: see Task 2 comment.
-        let fb_min_lon  = fb.min[0] as f64 - F32_BBOX_SLACK;
-        let fb_max_lon  = fb.max[0] as f64 + F32_BBOX_SLACK;
-        let fb_min_latp = fb.min[1] as f64 - F32_BBOX_SLACK;
-        let fb_max_latp = fb.max[1] as f64 + F32_BBOX_SLACK;
-        let fully_inside = fb_min_lon  >= min_lon
-                        && fb_max_lon  <= max_lon
-                        && fb_min_latp >= min_latp
-                        && fb_max_latp <= max_latp;
-
-        // Compute chain spans into a per-call scratch buffer. Task 5 will
-        // hoist this into a thread_local so it persists across tiles.
-        let mut clip_scratch = ClipScratch::default();
-        if fully_inside {
-            clip_scratch.spans.push((0, coords.len()));
-        } else {
-            clip_chain_spans_into(coords, &clip, &mut clip_scratch);
-        }
-
-        for &(start, end) in &clip_scratch.spans {
-            let chain = &coords[start..end];
-            // Simplify in (lon, latp) degp space. eps is always > 0 because of
-            // the sub-pixel floor, so we always run DP.
-            // Convert chain slice to (f64, f64) tuple form for simplify_into.
-            // Task 5 will hoist `pts`, `simplified`, dp_stack, dp_kept into a
-            // thread_local TileScratch; for this commit they are per-call.
-            let mut pts: Vec<(f64, f64)> = Vec::with_capacity(chain.len());
-            for p in chain { pts.push((p[0], p[1])); }
-            let mut dp_stack: Vec<(usize, usize)> = Vec::new();
-            let mut dp_kept: Vec<bool> = Vec::new();
-            let mut simplified: Vec<(f64, f64)> = Vec::new();
-            simplify_into(&pts, eps, &mut dp_stack, &mut dp_kept, &mut simplified);
-            if simplified.len() < 2 { continue; }
-
-            // Quantize to MVT extent (px, py), drop consecutive duplicates.
-            let mut points: Vec<(i32, i32)> = Vec::with_capacity(simplified.len());
-            for (lon, latp) in simplified {
-                let px = ((lon - min_lon) / xscale).floor() as i32;
-                let py = ((max_latp - latp) / yscale).floor() as i32;
-                if let Some(&last) = points.last() {
-                    if last == (px, py) { continue; }
+            let eps = match s.eps_cache[rec_layer_id as usize] {
+                Some(v) => v,
+                None => {
+                    let v = tile_eps_degp(
+                        z, src.simplify_below, src.simplify_level, src.simplify_length,
+                        src.simplify_ratio, tile_centre_latp).max(subpixel_eps);
+                    s.eps_cache[rec_layer_id as usize] = Some(v);
+                    v
                 }
-                points.push((px, py));
+            };
+
+            let coords = reader.coords_of(rec);
+
+            // Fast path: feature fully inside tile (see Task 2 comment).
+            let fb_min_lon  = fb.min[0] as f64 - F32_BBOX_SLACK;
+            let fb_max_lon  = fb.max[0] as f64 + F32_BBOX_SLACK;
+            let fb_min_latp = fb.min[1] as f64 - F32_BBOX_SLACK;
+            let fb_max_latp = fb.max[1] as f64 + F32_BBOX_SLACK;
+            let fully_inside = fb_min_lon  >= min_lon
+                            && fb_max_lon  <= max_lon
+                            && fb_min_latp >= min_latp
+                            && fb_max_latp <= max_latp;
+
+            s.clip.outcodes.clear();
+            s.clip.spans.clear();
+            if fully_inside {
+                s.clip.spans.push((0, coords.len()));
+            } else {
+                clip_chain_spans_into(coords, &clip, &mut s.clip);
             }
-            if points.len() < 2 { continue; }
 
-            groups.entry((rec_elevation, rec_flags))
-                .or_default()
-                .push(points);
+            // Plain Vec snapshot of spans so we can release the borrow on s.clip
+            // and mutate s.pts_f64 / s.simplified inside the loop.
+            // spans are typically 1-3 entries — this allocation is negligible
+            // compared to what we used to do per chain.
+            let spans_snap: Vec<(usize, usize)> = s.clip.spans.iter().copied().collect();
+
+            for (start, end) in spans_snap.into_iter() {
+                let chain = &coords[start..end];
+
+                s.pts_f64.clear();
+                s.pts_f64.reserve(chain.len());
+                for p in chain { s.pts_f64.push((p[0], p[1])); }
+
+                s.simplified.clear();
+                simplify_into(&s.pts_f64, eps, &mut s.dp_stack, &mut s.dp_kept, &mut s.simplified);
+                if s.simplified.len() < 2 { continue; }
+
+                // Quantize into a fresh Vec (will be moved into groups).
+                let mut points: Vec<(i32, i32)> = Vec::with_capacity(s.simplified.len());
+                for &(lon, latp) in &s.simplified {
+                    let px = ((lon - min_lon) / xscale).floor() as i32;
+                    let py = ((max_latp - latp) / yscale).floor() as i32;
+                    if let Some(&last) = points.last() {
+                        if last == (px, py) { continue; }
+                    }
+                    points.push((px, py));
+                }
+                if points.len() < 2 { continue; }
+
+                s.groups.entry((rec_elevation, rec_flags))
+                    .or_default()
+                    .push(points);
+            }
         }
-    }
 
-    if groups.is_empty() { return None; }
+        if !any_hits || s.groups.is_empty() { return None; }
 
-    // Materialise features in elevation order for deterministic output.
-    let mut keys: Vec<(i16, u8)> = groups.keys().copied().collect();
-    keys.sort();
-    let features_out: Vec<ContourFeature> = keys.into_iter().map(|(elev, flags)| {
-        let lines = groups.remove(&(elev, flags)).unwrap();
-        ContourFeature {
-            lines,
-            elevation: elev as i32,
-            main: (flags & 0b01) != 0,
-            show: (flags & 0b10) != 0,
-        }
-    }).collect();
+        // Materialise features in elevation order for deterministic output.
+        let mut keys: Vec<(i16, u8)> = s.groups.keys().copied().collect();
+        keys.sort();
+        let features_out: Vec<ContourFeature> = keys.into_iter().map(|(elev, flags)| {
+            let lines = s.groups.remove(&(elev, flags)).unwrap();
+            ContourFeature {
+                lines,
+                elevation: elev as i32,
+                main: (flags & 0b01) != 0,
+                show: (flags & 0b10) != 0,
+            }
+        }).collect();
 
-    let mvt = encode_tile(&features_out, output_layer_name, elevation_attr);
-    Some(mvt) // raw MVT — pmtiles writer compresses
+        let mvt = encode_tile(&features_out, output_layer_name, elevation_attr);
+        Some(mvt)
+    })
 }
 
 // Suppress unused-import warning if lat2latp isn't used yet.
