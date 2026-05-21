@@ -1,30 +1,35 @@
-//! Phase 1 driver: parallel-read SHPs, ordered-write to feature store.
+//! Phase 1 driver: parallel-read SHPs, arrival-order write to feature store.
 //! Produces `features.bin` + `coords.bin` + `rtree.bin` + `manifest.bin`.
 //!
 //! Concurrency model: rayon parallel-iterates SHPs across all available
 //! workers; each worker reads its SHP into a per-SHP `Vec<ReadFeature>`
 //! buffer (no streaming inside an SHP) and sends the whole buffer as a
-//! single `ShpResult` message. The writer (main thread) drains pending
-//! results from a small `BTreeMap`, pulling the next-expected SHP index
-//! whenever it becomes available and appending its features to the
-//! on-disk builder in order.
+//! single `ShpResult` message. The writer (main thread) appends each
+//! message's features to the on-disk builder as they arrive.
 //!
 //! Memory model: peak RAM during ingest is bounded by `(num_workers +
-//! pending) × max_shp_features × per-feature-bytes`. For the mapriot
-//! planet dataset the worst case is a few tens of GB transiently — well
-//! under the prod-box 100 GB cgroup. Steady-state RAM is the R-tree bbox
-//! vec only (~24 B/feature).
+//! chan_cap) × max_shp_in_memory`. For a 480-SHP planet build at
+//! `-j 10`, that's roughly 20–30 GB peak — well under the prod-box
+//! 100 GB cgroup. Steady-state RAM is the R-tree bbox vec only
+//! (~24 B/feature).
 //!
-//! Ordering is deterministic: SHPs are appended to features.bin/coords.bin
-//! in config order, regardless of which reader worker finished first.
-//! Features within an SHP arrive in shapefile-file order from the GDAL
-//! reader. The resulting feature store and R-tree are byte-reproducible
-//! across runs of the same binary on the same inputs.
+//! Ordering: features land in `features.bin` / `coords.bin` in whichever
+//! order rayon workers finish their SHPs. That order is NOT deterministic
+//! across runs (work-stealing scheduling varies). PMTiles output is
+//! visually identical across runs — each tile contains the same set of
+//! features — but MVT byte layout inside tiles can differ, so the final
+//! `.pmtiles` file is not byte-reproducible.
+//!
+//! Earlier versions of this driver buffered out-of-order arrivals in a
+//! `BTreeMap` to preserve config order. That buffer grew unboundedly on
+//! large datasets and caused cgroup-OOM around the half-way mark of
+//! planet ingest when a slow head-of-line SHP let dozens of GBs pile up
+//! behind it. Dropping the in-order constraint trades cross-run byte
+//! reproducibility for hard memory bounds.
 
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use rayon::prelude::*;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
 
@@ -40,10 +45,8 @@ pub struct IngestStats {
 }
 
 /// One reader worker's complete output: all features parsed from one SHP.
-/// Sent as a single message so the writer can drain SHPs atomically in
-/// config order without per-feature tagging.
+/// Sent as a single message so the writer doesn't need per-feature tagging.
 struct ShpResult {
-    shp_index: u16,
     features: Vec<(ReadFeature, u16)>, // (feature, layer_id)
 }
 
@@ -98,19 +101,18 @@ pub fn run(
     let read_result: Result<()> = std::thread::scope(|scope| {
         // Spawn one coordinator thread; inside it, rayon par_iter's across
         // SHPs. Each worker reads its SHP fully, packs all features into a
-        // single Vec, and sends one ShpResult tagged with the SHP index.
+        // single Vec, and sends one ShpResult per SHP.
         let inputs_ref = &parallel_inputs;
         let pb_ref = &pb;
         let read_handle = scope.spawn(move || -> Result<()> {
-            inputs_ref.par_iter().enumerate().try_for_each(|(i, (lid, s, col))| -> Result<()> {
+            inputs_ref.par_iter().try_for_each(|(lid, s, col)| -> Result<()> {
                 let lid = *lid;
-                let shp_idx = i as u16;
                 let mut shp_features: Vec<(ReadFeature, u16)> = Vec::new();
                 read_polylines_streaming(&s.shp_path, col, |feature| {
                     shp_features.push((feature, lid));
                     Ok(())
                 }).with_context(|| format!("read {:?}", s.shp_path))?;
-                tx.send(ShpResult { shp_index: shp_idx, features: shp_features })
+                tx.send(ShpResult { features: shp_features })
                     .map_err(|_| anyhow::anyhow!("writer thread terminated"))?;
                 pb_ref.inc(1);
                 Ok(())
@@ -120,18 +122,14 @@ pub fn run(
             Ok(())
         });
 
-        // Main thread is the writer. Drain results in SHP-config order via a
-        // BTreeMap that always exposes the smallest pending key, while
-        // accepting messages in arrival order.
-        let total_shps = inputs_ref.len();
-        let mut pending: BTreeMap<u16, Vec<(ReadFeature, u16)>> = BTreeMap::new();
-        let mut next_expected: u16 = 0;
-
-        while (next_expected as usize) < total_shps {
-            // Drain whatever is ready in order.
-            while pending.get(&next_expected).is_some() {
-                let features = pending.remove(&next_expected).unwrap();
-                for (f, lid) in features {
+        // Writer (main thread). Drain SHPs in arrival order — no out-of-order
+        // buffer. The IIFE lets us drop `rx` explicitly afterwards so any
+        // worker still blocked on send unblocks via SendError; otherwise
+        // std::thread::scope would hang trying to join workers waiting on a
+        // receiver that's still in scope.
+        let writer_result: Result<()> = (|| -> Result<()> {
+            for result in rx.iter() {
+                for (f, lid) in result.features {
                     let (minzoom, flags) = derive_attributes(f.elevation as i32);
                     builder.add_feature(&f.coords, f.elevation, minzoom, flags, lid)?;
                     bbox_entries.push(FeatureBbox {
@@ -141,28 +139,20 @@ pub fn run(
                     });
                     idx = idx.checked_add(1).context("feature count exceeds u32::MAX")?;
                 }
-                next_expected += 1;
             }
-            if (next_expected as usize) >= total_shps { break; }
-
-            // Wait for another worker to deliver an SHP.
-            match rx.recv() {
-                Ok(result) => { pending.insert(result.shp_index, result.features); }
-                Err(_) => {
-                    // Channel closed before SHP next_expected arrived. Means
-                    // a reader errored out; the par_iter Err will surface via
-                    // read_handle.join() below.
-                    break;
-                }
-            }
-        }
+            Ok(())
+        })();
+        drop(rx);
 
         // Surface any error from the reader pool (also catches the case where
-        // the writer terminated early and readers got a SendError).
-        match read_handle.join() {
+        // the writer terminated early and readers got a SendError). Writer
+        // error wins over reader error since the writer error is usually the
+        // root cause and the SendError is consequential.
+        let join_result: Result<()> = match read_handle.join() {
             Ok(r) => r,
             Err(_) => anyhow::bail!("reader thread panicked"),
-        }
+        };
+        writer_result.and(join_result)
     });
     read_result?;
     pb.finish_and_clear();
