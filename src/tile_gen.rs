@@ -141,6 +141,10 @@ use std::collections::HashMap;
 /// the length (capacity retained) between tiles.
 #[derive(Default)]
 struct TileScratch {
+    /// Decoded vertices for one feature (f64 lon/latp). coords.bin stores
+    /// fixed-point i32 pairs since 2026-05-21; we decode per-feature into
+    /// this reusable buffer so the rest of the pipeline keeps its f64 API.
+    coords_f64: Vec<[f64; 2]>,
     clip: crate::clip::ClipScratch,
     pts_f64: Vec<(f64, f64)>,
     simplified: Vec<(f64, f64)>,
@@ -217,7 +221,13 @@ pub fn process_tile(
                 }
             };
 
-            let coords = reader.coords_of(rec);
+            // Decode this feature's i32-fixed-point coords into the reusable
+            // f64 scratch buffer; downstream clip / simplify / quantize all
+            // keep their f64 API. The decode is one multiply per vertex —
+            // negligible compared to the memory-bandwidth win from storing
+            // 8 B/vertex instead of 16 B/vertex (prod is memory-stall bound).
+            reader.decode_coords_into(rec, &mut s.coords_f64);
+            let coords: &[[f64; 2]] = &s.coords_f64;
 
             // Fast path: if the feature's stored f32 bbox (expanded by
             // F32_BBOX_SLACK to absorb f32 rounding) sits inside the tile's
