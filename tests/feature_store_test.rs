@@ -21,8 +21,7 @@ fn write_and_count_records() {
 
     let coords_path = dir.path().join("coords.bin");
     let coords_meta = std::fs::metadata(&coords_path).unwrap();
-    // 8 B/vertex: two i32s, lon and latp at 1e-7 scale.
-    assert_eq!(coords_meta.len(), (3 + 5) * 8);
+    assert_eq!(coords_meta.len(), (3 + 5) * 16);
 }
 
 #[test]
@@ -44,18 +43,8 @@ fn round_trip_via_mmap_reader() {
     let e1 = recs[1].elevation;
     assert_eq!(e1, 50);
 
-    // coords_of returns raw i32 fixed-point at 1e-7 scale.
     let c0 = r.coords_of(&recs[0]);
-    assert_eq!(c0, &[[140_000_000_i32, 570_000_000], [145_000_000, 575_000_000]]);
-
-    // decode_coords_into reconstructs the f64 values (lossless to 1e-7 deg).
-    let mut decoded: Vec<[f64; 2]> = Vec::new();
-    r.decode_coords_into(&recs[0], &mut decoded);
-    assert_eq!(decoded.len(), 2);
-    for (got, exp) in decoded.iter().zip([[14.0_f64, 57.0], [14.5, 57.5]].iter()) {
-        assert!((got[0] - exp[0]).abs() < 5e-8, "lon: got {} expected {}", got[0], exp[0]);
-        assert!((got[1] - exp[1]).abs() < 5e-8, "latp: got {} expected {}", got[1], exp[1]);
-    }
+    assert_eq!(c0, &[[14.0, 57.0], [14.5, 57.5]]);
 }
 
 #[test]

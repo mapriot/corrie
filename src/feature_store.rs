@@ -1,26 +1,12 @@
 //! Packed binary feature store. Two files on disk:
 //!
 //! * `features.bin` — flat `[FeatureRecord]` array, 36 bytes each.
-//! * `coords.bin`   — flat `[[i32; 2]]` array of `(lon, latp)` vertices,
-//!                    fixed-point @ scale [`COORDS_SCALE`] = 1e7.
+//! * `coords.bin`   — flat `[[f64; 2]]` array of `(lon, latp)` vertices.
 //!
 //! Plus a `manifest.bin` (separate module concern) with the source hash.
 //!
 //! Layout is fixed and little-endian. `FeatureRecord` is `#[repr(C)]` so
 //! `bytemuck::cast_slice` can read it directly from an mmap.
-//!
-//! Coords were f64 pairs (16 B/vertex) until the 2026-05-21 prod-tr
-//! profile revealed the bottleneck was memory-stall-bound (86% L3 miss).
-//! Halving the bytes/vertex halves the memory traffic that the CPU stalls
-//! on. Quantization error at 1e-7 deg is ~5 mm at equator — well below the
-//! z=14 MVT sub-pixel (~30 cm), so visual output is identical though the
-//! exact MVT bytes for vertices that land near pixel boundaries may differ.
-
-/// Lon/latp scale factor. f64_value = i32_value * 1e-7. Max representable
-/// lon is +/- 214.7°, latp +/- 214.7° — both well above the Web-Mercator
-/// caps of +/-180° lon and +/-~85° latp.
-pub const COORDS_SCALE: f64 = 1e7;
-pub const COORDS_INV_SCALE: f64 = 1e-7;
 
 use bytemuck::{Pod, Zeroable};
 
@@ -72,8 +58,7 @@ impl Builder {
         })
     }
 
-    /// Append a feature. `coords` is the polyline in `(lon, latp)` f64 pairs;
-    /// stored on-disk as i32 fixed-point at [`COORDS_SCALE`].
+    /// Append a feature. `coords` is the polyline in `(lon, latp)` f64 pairs.
     pub fn add_feature(
         &mut self,
         coords: &[[f64; 2]],
@@ -85,8 +70,12 @@ impl Builder {
         let offset_vertices = self.n_vertices;
         let len_vertices = coords.len() as u32;
 
-        // Encode coords as i32 fixed-point. Compute the original-f64 bbox
-        // in the same pass — it stays f32 in FeatureRecord for the R-tree.
+        // Write coords first (in case features.bin write fails halfway).
+        let bytes: &[u8] = bytemuck::cast_slice(coords);
+        self.coords.write_all(bytes).context("write coords")?;
+        self.n_vertices += coords.len() as u64;
+
+        // Compute bbox.
         let (mut mnx, mut mny) = (f64::INFINITY, f64::INFINITY);
         let (mut mxx, mut mxy) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
         for c in coords {
@@ -94,14 +83,7 @@ impl Builder {
             if c[1] < mny { mny = c[1]; }
             if c[0] > mxx { mxx = c[0]; }
             if c[1] > mxy { mxy = c[1]; }
-            let q: [i32; 2] = [
-                (c[0] * COORDS_SCALE).round() as i32,
-                (c[1] * COORDS_SCALE).round() as i32,
-            ];
-            let q_bytes: &[u8] = bytemuck::bytes_of(&q);
-            self.coords.write_all(q_bytes).context("write coords")?;
         }
-        self.n_vertices += coords.len() as u64;
 
         let rec = FeatureRecord {
             bbox_min_lon:  mnx as f32,
@@ -160,39 +142,11 @@ impl Reader {
         bytemuck::cast_slice(&self.features_mmap[..])
     }
 
-    /// Raw i32 fixed-point coordinates for the feature. Each `[i32; 2]` is
-    /// `[lon * COORDS_SCALE, latp * COORDS_SCALE]`. Multiply by
-    /// [`COORDS_INV_SCALE`] for f64 values.
-    pub fn coords_of(&self, rec: &FeatureRecord) -> &[[i32; 2]] {
-        let start_bytes = rec.coords_offset as usize * 8;
-        let end_bytes   = start_bytes + rec.coords_len as usize * 8;
+    pub fn coords_of(&self, rec: &FeatureRecord) -> &[[f64; 2]] {
+        let start_bytes = rec.coords_offset as usize * 16;
+        let end_bytes   = start_bytes + rec.coords_len as usize * 16;
         let slice = &self.coords_mmap[start_bytes..end_bytes];
         bytemuck::cast_slice(slice)
-    }
-
-    /// Decode a feature's coords into the caller-provided buffer as
-    /// `[f64; 2]` pairs in source (lon, latp) units. The buffer is
-    /// cleared and grown as needed; capacity is retained for reuse.
-    /// This is the per-feature decode the hot loop calls.
-    #[inline(always)]
-    pub fn decode_coords_into(&self, rec: &FeatureRecord, out: &mut Vec<[f64; 2]>) {
-        let q = self.coords_of(rec);
-        let n = q.len();
-        out.clear();
-        out.reserve(n);
-        // Unsafe ptr write to skip Vec::push's per-element capacity check;
-        // we've reserved exactly n. This is the same pattern that mattered
-        // in the pre-fuse clip code where push overhead dominated.
-        unsafe {
-            let dst = out.as_mut_ptr();
-            for (i, src) in q.iter().enumerate() {
-                dst.add(i).write([
-                    src[0] as f64 * COORDS_INV_SCALE,
-                    src[1] as f64 * COORDS_INV_SCALE,
-                ]);
-            }
-            out.set_len(n);
-        }
     }
 }
 
