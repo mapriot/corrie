@@ -253,7 +253,7 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
     use corrie::feature_store::{Reader, cache_valid};
     use corrie::spatial_index::load_rtree;
     use corrie::tile_gen::{hilbert_sort, process_tile};
-    use corrie::container::pmtiles::PmtilesWriter;
+    use corrie::container::pmtiles::{gzip_tile, tile_id, PmtilesWriter};
 
     if let Some(w) = args.workers {
         rayon::ThreadPoolBuilder::new().num_threads(w).build_global()
@@ -372,19 +372,22 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
     const CHUNK: usize = 4096;
 
     let mut written = 0u64;
+    // Workers build and gzip tiles; the main thread only appends bytes.
     for chunk in tiles.chunks(CHUNK) {
-        let results: Vec<Option<Vec<u8>>> = chunk
+        let results: Vec<anyhow::Result<Option<Vec<u8>>>> = chunk
             .par_iter()
             .map(|&t| {
-                let r = process_tile(t, &reader, &rtree, &sources, &output_layer, "elevation");
+                let r = process_tile(t, &reader, &rtree, &sources, &output_layer, "elevation")
+                    .map(|mvt| gzip_tile(&mvt))
+                    .transpose();
                 pb.inc(1);
                 r
             })
             .collect();
-        for (i, blob_opt) in results.into_iter().enumerate() {
-            if let Some(blob) = blob_opt {
+        for (i, gz) in results.into_iter().enumerate() {
+            if let Some(gz) = gz? {
                 let t = chunk[i];
-                writer.add_tile(t.z, t.x, t.y, &blob)?;
+                writer.add_tile_gzipped(tile_id(t.z, t.x, t.y), &gz)?;
                 written += 1;
             }
         }

@@ -295,7 +295,7 @@ fn gzip(input: &[u8]) -> anyhow::Result<Vec<u8>> {
 /// exclusively for tile MVTs at add_tile time; leaf/root directories and
 /// metadata still use the default level via `gzip`, since they're written
 /// once at finalize and file-size matters more than CPU there.
-fn gzip_tile(input: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub fn gzip_tile(input: &[u8]) -> anyhow::Result<Vec<u8>> {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::io::Write;
@@ -351,6 +351,9 @@ pub struct PmtilesWriter {
     last_tile_id: Option<u64>,
     /// Running count of tiles written. Used by finalize for header fields.
     total_addressed: u64,
+    /// True when the file cursor is not at `next_tile_offset` (after a leaf
+    /// write, or before the first tile).
+    cursor_elsewhere: bool,
 }
 
 impl PmtilesWriter {
@@ -418,13 +421,22 @@ impl PmtilesWriter {
             metadata_json,
             last_tile_id: None,
             total_addressed: 0,
+            cursor_elsewhere: true,
         })
     }
 
     pub fn add_tile(&mut self, z: u8, x: u32, y: u32, mvt_raw: &[u8]) -> anyhow::Result<()> {
-        let id = tile_id(z, x, y);
+        let gz = gzip_tile(mvt_raw).context("gzip tile MVT")?;
+        self.add_tile_gzipped(tile_id(z, x, y), &gz)
+    }
+
+    /// Append a tile whose bytes are already gzipped (see [`gzip_tile`]), so
+    /// callers can compress on worker threads and keep this serial path to
+    /// plain writes.
+    pub fn add_tile_gzipped(&mut self, id: u64, gz: &[u8]) -> anyhow::Result<()> {
         if let Some(prev) = self.last_tile_id {
             if id <= prev {
+                let (z, x, y) = tile_id_to_zxy(id);
                 anyhow::bail!(
                     "tile_id must be strictly monotonic: got {id} after {prev} (z={z}, x={x}, y={y})"
                 );
@@ -432,13 +444,17 @@ impl PmtilesWriter {
         }
         self.last_tile_id = Some(id);
 
-        let gz = gzip_tile(mvt_raw).context("gzip tile MVT")?;
         let offset_in_section = self.next_tile_offset - self.tile_data_section_start;
 
-        // Seek to the absolute tile-data position before writing.
-        self.file.seek(SeekFrom::Start(self.next_tile_offset))
-            .context("seek to next tile offset")?;
-        self.file.write_all(&gz).context("write tile bytes")?;
+        // Seek to the absolute tile-data position before writing — but only
+        // after a leaf flush moved the cursor: seeking a BufWriter flushes
+        // it, which would turn every tile into its own write syscall.
+        if self.cursor_elsewhere {
+            self.file.seek(SeekFrom::Start(self.next_tile_offset))
+                .context("seek to next tile offset")?;
+            self.cursor_elsewhere = false;
+        }
+        self.file.write_all(gz).context("write tile bytes")?;
         self.next_tile_offset += gz.len() as u64;
 
         self.leaf_buffer.push(DirEntry {
@@ -476,6 +492,7 @@ impl PmtilesWriter {
         self.file.seek(SeekFrom::Start(self.leaves_cursor))
             .context("seek to leaf position")?;
         self.file.write_all(&gz).context("write leaf bytes")?;
+        self.cursor_elsewhere = true;
 
         // Record a root entry pointing to this leaf. Per spec, root entries
         // pointing at leaves use run_length=0 and (offset, length) into the
