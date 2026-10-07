@@ -272,6 +272,7 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
         rayon::ThreadPoolBuilder::new().num_threads(w).build_global()
             .context("rayon")?;
     }
+    corrie::cleanup::check_output(&args.output)?;
     let cfg = parse(&args.config)?;
     let sources = parse_and_resolve(&args.config)?;
     // All sources go into one MVT layer: the output layer of the first
@@ -306,6 +307,7 @@ fn run_merge(args: MergeArgs) -> anyhow::Result<()> {
         rayon::ThreadPoolBuilder::new().num_threads(w).build_global().context("rayon")?;
     }
     let t0 = std::time::Instant::now();
+    corrie::cleanup::check_output(&args.output)?;
     let merge = corrie::merge::Merge::open(&args.inputs)?;
     let stats = merge.write(&args.output, "elevation")?;
     eprintln!("Merged {} archives: {} tiles, {} present in several inputs, in {:.1}s",
