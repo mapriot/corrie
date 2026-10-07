@@ -10,8 +10,9 @@
 //! Memory model: peak RAM during ingest is bounded by `(num_workers +
 //! chan_cap) × max_shp_in_memory`. For a 480-SHP planet build at
 //! `-j 10`, that's roughly 20–30 GB peak — well under the prod-box
-//! 100 GB cgroup. Steady-state RAM is the R-tree bbox vec only
-//! (~24 B/feature).
+//! 100 GB cgroup. The index adds to that: 24 B per indexed chunk while
+//! reading, then the R-tree built from it (~50 B per chunk) next to the
+//! list. Contour data has ~2.3 chunks per line (Madagascar).
 //!
 //! Ordering: features land in `features.bin` / `coords.bin` in whichever
 //! order rayon workers finish their SHPs. That order is NOT deterministic
@@ -37,7 +38,7 @@ use crate::attribute_rules::derive_attributes;
 use crate::config::SourceLayer;
 use crate::feature_store::{Builder, Manifest, compute_source_hash, write_manifest, MANIFEST_VERSION};
 use crate::shapefile_read::{read_polylines_streaming, ReadFeature};
-use crate::spatial_index::{build_rtree, save_rtree, FeatureBbox};
+use crate::spatial_index::{build_rtree, push_chunk_bboxes, save_rtree, FeatureBbox};
 
 pub struct IngestStats {
     pub features: u64,
@@ -132,11 +133,7 @@ pub fn run(
                 for (f, lid) in result.features {
                     let (minzoom, flags) = derive_attributes(f.elevation as i32);
                     builder.add_feature(&f.coords, f.elevation, minzoom, flags, lid)?;
-                    bbox_entries.push(FeatureBbox {
-                        idx,
-                        min: [f.bbox_min_lon as f32, f.bbox_min_latp as f32],
-                        max: [f.bbox_max_lon as f32, f.bbox_max_latp as f32],
-                    });
+                    push_chunk_bboxes(idx, &f.coords, &mut bbox_entries);
                     idx = idx.checked_add(1).context("feature count exceeds u32::MAX")?;
                 }
             }

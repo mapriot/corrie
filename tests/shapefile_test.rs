@@ -23,19 +23,3 @@ fn read_tiny_fixture() {
         assert!(f.coords[0][1] > 49.0); // latp(50) ≈ 57.5 but still positive
     }
 }
-
-#[test]
-fn read_features_have_bbox() {
-    let dir = tempfile::tempdir().unwrap();
-    let shp = common::write_tiny_shapefile(dir.path());
-    let features = read_all(&shp, "elevation");
-    for f in &features {
-        // All vertices should be inside the feature's bbox.
-        for c in &f.coords {
-            assert!(c[0] >= f.bbox_min_lon - 1e-12);
-            assert!(c[0] <= f.bbox_max_lon + 1e-12);
-            assert!(c[1] >= f.bbox_min_latp - 1e-12);
-            assert!(c[1] <= f.bbox_max_latp + 1e-12);
-        }
-    }
-}

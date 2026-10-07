@@ -4,9 +4,9 @@ use rstar::AABB;
 #[test]
 fn build_and_query() {
     let boxes = vec![
-        FeatureBbox { idx: 0, min: [0.0, 0.0], max: [1.0, 1.0] },
-        FeatureBbox { idx: 1, min: [2.0, 2.0], max: [3.0, 3.0] },
-        FeatureBbox { idx: 2, min: [0.5, 0.5], max: [2.5, 2.5] },
+        FeatureBbox { idx: 0, chunk: 0, min: [0.0, 0.0], max: [1.0, 1.0] },
+        FeatureBbox { idx: 1, chunk: 0, min: [2.0, 2.0], max: [3.0, 3.0] },
+        FeatureBbox { idx: 2, chunk: 0, min: [0.5, 0.5], max: [2.5, 2.5] },
     ];
     let tree = build_rtree(boxes);
 
@@ -23,8 +23,8 @@ fn build_and_query() {
 fn save_and_load_rtree() {
     let dir = tempfile::tempdir().unwrap();
     let boxes = vec![
-        FeatureBbox { idx: 0, min: [0.0, 0.0], max: [1.0, 1.0] },
-        FeatureBbox { idx: 1, min: [5.0, 5.0], max: [6.0, 6.0] },
+        FeatureBbox { idx: 0, chunk: 0, min: [0.0, 0.0], max: [1.0, 1.0] },
+        FeatureBbox { idx: 1, chunk: 0, min: [5.0, 5.0], max: [6.0, 6.0] },
     ];
     let tree = build_rtree(boxes);
     save_rtree(&tree, dir.path()).unwrap();

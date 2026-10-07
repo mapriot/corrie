@@ -6,8 +6,8 @@
 //! (e.g. `contours/au/final_contours_6_4_0_1.shp` at 2.5 GB).
 //!
 //! Each emitted feature carries the polyline coordinates already projected
-//! from `(lon, lat)` WGS84 to `(lon, latp)` tilemaker space, the integer
-//! elevation, and the bbox in `(lon, latp)`.
+//! from `(lon, lat)` WGS84 to `(lon, latp)` tilemaker space, and the integer
+//! elevation.
 
 use anyhow::{anyhow, Context, Result};
 use gdal::vector::{Geometry, LayerAccess, OGRwkbGeometryType};
@@ -22,11 +22,6 @@ pub struct ReadFeature {
     pub coords: Vec<[f64; 2]>,
     /// Floor of the DBF elevation column, clamped to i16 range.
     pub elevation: i16,
-    /// Bounding box in `(lon, latp)`.
-    pub bbox_min_lon: f64,
-    pub bbox_min_latp: f64,
-    pub bbox_max_lon: f64,
-    pub bbox_max_latp: f64,
 }
 
 /// Read polyline features from a shapefile via GDAL/OGR, projecting
@@ -122,24 +117,10 @@ where
     if n < 2 { return Ok(()); }
 
     let mut coords: Vec<[f64; 2]> = Vec::with_capacity(n);
-    let (mut mnx, mut mny) = (f64::INFINITY, f64::INFINITY);
-    let (mut mxx, mut mxy) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
     for i in 0..n {
         let (x, y, _z) = geom.get_point(i as i32);
-        let latp = lat2latp(y);
-        coords.push([x, latp]);
-        if x < mnx { mnx = x; }
-        if x > mxx { mxx = x; }
-        if latp < mny { mny = latp; }
-        if latp > mxy { mxy = latp; }
+        coords.push([x, lat2latp(y)]);
     }
 
-    emit(ReadFeature {
-        coords,
-        elevation,
-        bbox_min_lon: mnx,
-        bbox_min_latp: mny,
-        bbox_max_lon: mxx,
-        bbox_max_latp: mxy,
-    })
+    emit(ReadFeature { coords, elevation })
 }

@@ -153,7 +153,8 @@ impl Reader {
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const MANIFEST_VERSION: u32 = 1;
+/// Bumped whenever the on-disk cache layout changes (2: chunked R-tree).
+pub const MANIFEST_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Manifest {

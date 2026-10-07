@@ -81,6 +81,7 @@ fn pruned_subset_of_unpruned() {
     // Place one feature bbox in roughly the Prague tile area at z=11.
     let boxes = vec![FeatureBbox {
         idx: 0,
+        chunk: 0,
         min: [14.3_f32, corrie::mercator::lat2latp(50.0) as f32],
         max: [14.5_f32, corrie::mercator::lat2latp(50.1) as f32],
     }];

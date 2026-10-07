@@ -84,9 +84,27 @@ pub fn enumerate_tiles_pruned(
     zmin: u8,
     zmax: u8,
 ) -> Vec<TileCoord> {
-    // Start with all tiles at zmin intersecting bbox — reuse the existing
-    // single-zoom enumeration to avoid duplicating bbox→tile math.
-    let mut stack: Vec<TileCoord> = enumerate_tiles(bbox, zmin, zmin);
+    // Seed with every zmin tile that intersects bbox, edges included: when
+    // the data's west or north edge lies exactly on a tile edge, the tile on
+    // the other side touches it and can get a stub of a line (a run of
+    // only some groups' data must visit the same tiles as a run of all).
+    let mut stack: Vec<TileCoord> = Vec::new();
+    {
+        let n = 1i64 << zmin;
+        let latp_max = tiley2latp(0, zmin);
+        let fx = |lon: f64| (lon + 180.0) / 360.0 * n as f64;
+        let fy = |latp: f64| (latp_max - latp) / (2.0 * latp_max) * n as f64;
+        let clamp = |v: f64| (v as i64).clamp(0, n - 1) as u32;
+        let x0 = clamp(fx(bbox[0]).ceil() - 1.0);
+        let x1 = clamp(fx(bbox[2]).floor());
+        let y0 = clamp(fy(lat2latp(bbox[3])).ceil() - 1.0); // north edge
+        let y1 = clamp(fy(lat2latp(bbox[1])).floor());
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                stack.push(TileCoord { z: zmin, x, y });
+            }
+        }
+    }
     let mut out: Vec<TileCoord> = Vec::new();
 
     while let Some(t) = stack.pop() {
@@ -112,10 +130,14 @@ fn tile_to_aabb_f32(t: TileCoord) -> rstar::AABB<[f32; 2]> {
     let max_lon  = tilex2lon(t.x + 1, t.z);
     let max_latp = tiley2latp(t.y, t.z);
     let min_latp = tiley2latp(t.y + 1, t.z);
-    rstar::AABB::from_corners(
-        [min_lon as f32, min_latp as f32],
-        [max_lon as f32, max_latp as f32],
-    )
+    query_aabb(min_lon, min_latp, max_lon, max_latp)
+}
+
+/// f32 query box that contains the f64 box (rounded outward), so a chunk
+/// touching the tile edge is never lost to f32 rounding.
+fn query_aabb(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> rstar::AABB<[f32; 2]> {
+    use crate::spatial_index::{f32_down, f32_up};
+    rstar::AABB::from_corners([f32_down(min_x), f32_down(min_y)], [f32_up(max_x), f32_up(max_y)])
 }
 
 /// In-place Hilbert-curve ordering. PMTiles requires directory entries to
@@ -131,8 +153,8 @@ use crate::config::SourceLayer;
 use crate::feature_store::{FeatureRecord, Reader};
 use crate::mvt::{encode_tile, ContourFeature, EXTENT};
 use crate::simplify::simplify_into;
-use crate::spatial_index::FeatureBbox;
-use rstar::{RTree, AABB};
+use crate::spatial_index::{chunk_vertex_range, FeatureBbox};
+use rstar::RTree;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -141,6 +163,10 @@ use std::collections::HashMap;
 /// the length (capacity retained) between tiles.
 #[derive(Default)]
 struct TileScratch {
+    /// (feature idx, chunk) R-tree hits for the current tile, sorted.
+    hits: Vec<(u32, u32)>,
+    /// Clipped spans of the current feature, as vertex ranges into its coords.
+    spans: Vec<(usize, usize)>,
     clip: crate::clip::ClipScratch,
     pts_f64: Vec<(f64, f64)>,
     simplified: Vec<(f64, f64)>,
@@ -152,6 +178,35 @@ struct TileScratch {
 
 thread_local! {
     static SCRATCH: RefCell<TileScratch> = RefCell::new(TileScratch::default());
+}
+
+/// Clip the chunks of one polyline that the index returned for a tile.
+/// `hits` are that polyline's (feature, chunk) hits sorted by chunk; the
+/// clipped spans are appended to `spans` as vertex ranges into `coords`.
+///
+/// Each run of consecutive chunks is clipped as one piece. A chunk missing
+/// from the hits has no segment touching the tile, so a chain never
+/// continues across a gap between runs: the spans are exactly those a clip
+/// of the whole polyline would produce.
+pub fn clip_chunk_runs(
+    coords: &[[f64; 2]],
+    hits: &[(u32, u32)],
+    clip: &Box2,
+    scratch: &mut crate::clip::ClipScratch,
+    spans: &mut Vec<(usize, usize)>,
+) {
+    let n = coords.len();
+    let mut k = 0;
+    while k < hits.len() {
+        let run_first = hits[k].1;
+        let mut run_last = run_first;
+        k += 1;
+        while k < hits.len() && hits[k].1 == run_last + 1 { run_last += 1; k += 1; }
+        let (v0, _) = chunk_vertex_range(run_first, n);
+        let (_, v1) = chunk_vertex_range(run_last, n);
+        clip_chain_spans_into(&coords[v0..v1], clip, scratch);
+        spans.extend(scratch.spans.iter().map(|&(a, b)| (v0 + a, v0 + b)));
+    }
 }
 
 /// Per-tile output: raw MVT bytes (uncompressed), or None if empty.
@@ -183,9 +238,13 @@ pub fn process_tile(
         let inv_yscale = 1.0 / yscale;
         let subpixel_eps = 0.5 * xscale;
 
-        // R-tree query — stream directly, no Vec<&FeatureBbox> materialisation.
-        let query = AABB::from_corners([min_lon as f32, min_latp as f32], [max_lon as f32, max_latp as f32]);
-        let mut any_hits = false;
+        // R-tree query → (feature, chunk) hits. Sorting puts each feature's
+        // chunks next to each other, in order along the line.
+        let query = query_aabb(min_lon, min_latp, max_lon, max_latp);
+        s.hits.clear();
+        s.hits.extend(rtree.locate_in_envelope_intersecting(&query).map(|fb| (fb.idx, fb.chunk)));
+        if s.hits.is_empty() { return None; }
+        s.hits.sort_unstable();
 
         // Reset per-tile scratch (length=0, capacity retained).
         s.eps_cache.clear();
@@ -194,9 +253,15 @@ pub fn process_tile(
 
         let feature_recs: &[FeatureRecord] = reader.features();
 
-        for fb in rtree.locate_in_envelope_intersecting(&query) {
-            any_hits = true;
-            let rec = &feature_recs[fb.idx as usize];
+        let mut i = 0;
+        while i < s.hits.len() {
+            let idx = s.hits[i].0;
+            let mut j = i + 1;
+            while j < s.hits.len() && s.hits[j].0 == idx { j += 1; }
+            let (first_hit, end_hit) = (i, j);
+            i = j;
+
+            let rec = &feature_recs[idx as usize];
             let rec_layer_id = rec.layer_id;
             let rec_minzoom = rec.minzoom;
             let rec_elevation = rec.elevation;
@@ -218,34 +283,26 @@ pub fn process_tile(
             };
 
             let coords = reader.coords_of(rec);
+            let n = coords.len();
 
             // Fast path: if the feature's stored f32 bbox (expanded by
             // F32_BBOX_SLACK to absorb f32 rounding) sits inside the tile's
             // f64 clip box, clipping would emit a single chain == whole
             // polyline. Skip the outcode pass entirely.
-            let fb_min_lon  = fb.min[0] as f64 - F32_BBOX_SLACK;
-            let fb_max_lon  = fb.max[0] as f64 + F32_BBOX_SLACK;
-            let fb_min_latp = fb.min[1] as f64 - F32_BBOX_SLACK;
-            let fb_max_latp = fb.max[1] as f64 + F32_BBOX_SLACK;
-            let fully_inside = fb_min_lon  >= min_lon
-                            && fb_max_lon  <= max_lon
-                            && fb_min_latp >= min_latp
-                            && fb_max_latp <= max_latp;
+            let fully_inside = rec.bbox_min_lon  as f64 - F32_BBOX_SLACK >= min_lon
+                            && rec.bbox_max_lon  as f64 + F32_BBOX_SLACK <= max_lon
+                            && rec.bbox_min_latp as f64 - F32_BBOX_SLACK >= min_latp
+                            && rec.bbox_max_latp as f64 + F32_BBOX_SLACK <= max_latp;
 
-            s.clip.spans.clear();
+            s.spans.clear();
             if fully_inside {
-                s.clip.spans.push((0, coords.len()));
+                s.spans.push((0, n));
             } else {
-                clip_chain_spans_into(coords, &clip, &mut s.clip);
+                clip_chunk_runs(coords, &s.hits[first_hit..end_hit], &clip, &mut s.clip, &mut s.spans);
             }
 
-            // Plain Vec snapshot of spans so we can release the borrow on s.clip
-            // and mutate s.pts_f64 / s.simplified inside the loop.
-            // spans are typically 1-3 entries — this allocation is negligible
-            // compared to what we used to do per chain.
-            let spans_snap: Vec<(usize, usize)> = s.clip.spans.iter().copied().collect();
-
-            for (start, end) in spans_snap.into_iter() {
+            for si in 0..s.spans.len() {
+                let (start, end) = s.spans[si];
                 let chain = &coords[start..end];
 
                 s.pts_f64.clear();
@@ -274,7 +331,7 @@ pub fn process_tile(
             }
         }
 
-        if !any_hits || s.groups.is_empty() { return None; }
+        if s.groups.is_empty() { return None; }
 
         // Materialise features in elevation order for deterministic output.
         let mut keys: Vec<(i16, u8)> = s.groups.keys().copied().collect();
@@ -292,4 +349,109 @@ pub fn process_tile(
         let mvt = encode_tile(&features_out, output_layer_name, elevation_attr);
         Some(mvt)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clip::ClipScratch;
+    use crate::spatial_index::{build_rtree, push_chunk_bboxes, FeatureBbox, CHUNK_SEGMENTS};
+    use rstar::Envelope;
+
+    /// Small deterministic generator (xorshift64*), no extra dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12; self.0 ^= self.0 << 25; self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+        fn unit(&mut self) -> f64 { (self.next() >> 11) as f64 / (1u64 << 53) as f64 }
+    }
+
+    fn tile_box(t: TileCoord) -> Box2 {
+        Box2 {
+            min_x: tilex2lon(t.x, t.z), max_x: tilex2lon(t.x + 1, t.z),
+            min_y: tiley2latp(t.y + 1, t.z), max_y: tiley2latp(t.y, t.z),
+        }
+    }
+
+    /// Clipping only the chunk runs the index returns gives exactly the spans
+    /// of clipping the whole polyline, including lines that leave and
+    /// re-enter the tile, vertices exactly on tile edges, and f32-exact
+    /// coordinates.
+    #[test]
+    fn chunk_runs_clip_like_the_whole_polyline() {
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        let tile = TileCoord { z: 13, x: 4440, y: 2830 };
+        let b = tile_box(tile);
+        let (w, h) = (b.max_x - b.min_x, b.max_y - b.min_y);
+        let query = query_aabb(b.min_x, b.min_y, b.max_x, b.max_y);
+        let mut scratch = ClipScratch::default();
+        let (mut whole, mut runs) = (Vec::new(), Vec::new());
+        let mut checked_multi = 0;
+        for case in 0..60_000 {
+            let n = 2 + (rng.next() % 1200) as usize;
+            // A random walk around the tile, some steps big enough to leave it.
+            let (mut x, mut y) = (b.min_x + rng.unit() * w, b.min_y + rng.unit() * h);
+            let step = w * [0.01, 0.1, 0.5][case % 3];
+            let mut coords = Vec::with_capacity(n);
+            for _ in 0..n {
+                x += (rng.unit() - 0.5) * step;
+                y += (rng.unit() - 0.5) * step;
+                let mut p = [x, y];
+                match rng.next() % 20 {
+                    0 => p[0] = if rng.next() % 2 == 0 { b.min_x } else { b.max_x },
+                    1 => p[1] = if rng.next() % 2 == 0 { b.min_y } else { b.max_y },
+                    2 => p = [p[0] as f32 as f64, p[1] as f32 as f64],
+                    _ => {}
+                }
+                coords.push(p);
+            }
+
+            clip_chain_spans_into(&coords, &b, &mut scratch);
+            whole.clear();
+            whole.extend_from_slice(&scratch.spans);
+
+            let mut chunks = Vec::new();
+            push_chunk_bboxes(0, &coords, &mut chunks);
+            let hits: Vec<(u32, u32)> = chunks.iter()
+                .filter(|c: &&FeatureBbox| rstar::RTreeObject::envelope(*c).intersects(&query))
+                .map(|c| (c.idx, c.chunk))
+                .collect();
+            runs.clear();
+            clip_chunk_runs(&coords, &hits, &b, &mut scratch, &mut runs);
+            assert_eq!(whole, runs, "case {case}: n={n}");
+            if n > CHUNK_SEGMENTS * 2 && hits.len() > 1 && hits.len() < chunks.len() { checked_multi += 1; }
+        }
+        assert!(checked_multi > 1000, "too few cases with gaps between chunk runs: {checked_multi}");
+    }
+
+    /// A run over only some groups of sources visits the same tiles as a run
+    /// over all of them: a tile that only touches the data at its west or
+    /// north edge is still seeded.
+    #[test]
+    fn pruned_enumeration_includes_tiles_touching_the_data_edge() {
+        let t = TileCoord { z: 11, x: 1100, y: 690 };
+        let edge_lon = tilex2lon(t.x, t.z); // west edge of t = east edge of x-1
+        let edge_latp = tiley2latp(t.y, t.z); // north edge of t = south edge of y-1
+        assert_eq!(edge_lon as f32 as f64, edge_lon);
+        let mid_latp = (tiley2latp(t.y, t.z) + tiley2latp(t.y + 1, t.z)) / 2.0;
+        let mid_lon = (tilex2lon(t.x, t.z) + tilex2lon(t.x + 1, t.z)) / 2.0;
+        let line = |a: [f64; 2], b: [f64; 2]| {
+            let mut v = Vec::new();
+            push_chunk_bboxes(0, &[a, b], &mut v);
+            build_rtree(v)
+        };
+        // Starts exactly on the west edge and runs east.
+        let rt = line([edge_lon, mid_latp], [mid_lon, mid_latp]);
+        let bbox = [edge_lon, crate::mercator::latp2lat(mid_latp), mid_lon, crate::mercator::latp2lat(mid_latp)];
+        let tiles = enumerate_tiles_pruned(&rt, bbox, 11, 11);
+        assert!(tiles.contains(&TileCoord { z: 11, x: t.x - 1, y: t.y }), "{tiles:?}");
+        // Starts exactly on the north edge and runs south.
+        let rt = line([mid_lon, edge_latp], [mid_lon, mid_latp]);
+        let lat = crate::mercator::latp2lat;
+        let bbox = [mid_lon, lat(mid_latp), mid_lon, lat(edge_latp)];
+        let tiles = enumerate_tiles_pruned(&rt, bbox, 11, 11);
+        assert!(tiles.contains(&TileCoord { z: 11, x: t.x, y: t.y - 1 }), "{tiles:?}");
+    }
 }
