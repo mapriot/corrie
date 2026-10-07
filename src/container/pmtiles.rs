@@ -577,10 +577,178 @@ fn write_zeros<W: Write>(w: &mut W, n: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---------------- tile_id → (z, x, y) ----------------
+
+/// Inverse of [`tile_id`]. Port of go-pmtiles `IdToZxy`.
+pub fn tile_id_to_zxy(id: u64) -> (u8, u32, u32) {
+    let mut acc = 0u64;
+    let mut z = 0u8;
+    loop {
+        let num_tiles = 1u64 << (2 * z as u64);
+        if acc + num_tiles > id {
+            let n = 1u64 << z;
+            let mut t = id - acc;
+            let (mut tx, mut ty) = (0u64, 0u64);
+            let mut s = 1u64;
+            while s < n {
+                let rx = 1 & (t / 2);
+                let ry = 1 & (t ^ rx);
+                if ry == 0 {
+                    if rx == 1 {
+                        tx = s - 1 - tx;
+                        ty = s - 1 - ty;
+                    }
+                    std::mem::swap(&mut tx, &mut ty);
+                }
+                tx += s * rx;
+                ty += s * ry;
+                t /= 4;
+                s *= 2;
+            }
+            return (z, tx as u32, ty as u32);
+        }
+        acc += num_tiles;
+        z += 1;
+    }
+}
+
+// ---------------- PmtilesReader ----------------
+
+/// One addressed tile: `tile_id` plus its byte range in the file
+/// (absolute offset, i.e. already including `tile_data_offset`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileEntry {
+    pub tile_id: u64,
+    pub offset: u64,
+    pub length: u32,
+}
+
+/// Mmap-backed read-only PMTiles v3 archive.
+pub struct PmtilesReader {
+    mmap: memmap2::Mmap,
+    header: Header,
+}
+
+impl PmtilesReader {
+    pub fn open(path: &Path) -> anyhow::Result<Self> {
+        let f = File::open(path).with_context(|| format!("open {:?}", path))?;
+        let mmap = unsafe { memmap2::Mmap::map(&f)? };
+        let header = deserialize_header(&mmap).with_context(|| format!("header of {:?}", path))?;
+        if header.internal_compression != COMPRESSION_GZIP && header.internal_compression != COMPRESSION_NONE {
+            anyhow::bail!("{:?}: unsupported internal compression {}", path, header.internal_compression);
+        }
+        Ok(Self { mmap, header })
+    }
+
+    pub fn header(&self) -> &Header { &self.header }
+
+    pub fn metadata_json(&self) -> anyhow::Result<String> {
+        let h = &self.header;
+        let raw = self.section(h.json_metadata_offset, h.json_metadata_bytes)?;
+        let bytes = self.decompress_internal(raw)?;
+        Ok(String::from_utf8(bytes)?)
+    }
+
+    /// Every addressed tile in tile_id order. Runs (`run_length > 1`) are
+    /// expanded into one entry per tile_id, all pointing at the same bytes.
+    pub fn entries(&self) -> anyhow::Result<Vec<TileEntry>> {
+        let mut out = Vec::with_capacity(self.header.addressed_tiles_count as usize);
+        let h = &self.header;
+        let root = self.read_directory(h.root_dir_offset, h.root_dir_bytes)?;
+        self.walk(&root, &mut out)?;
+        Ok(out)
+    }
+
+    /// The tile's stored bytes (compressed per `header.tile_compression`).
+    pub fn tile_bytes(&self, e: &TileEntry) -> &[u8] {
+        &self.mmap[e.offset as usize..e.offset as usize + e.length as usize]
+    }
+
+    fn walk(&self, dir: &[DirEntry], out: &mut Vec<TileEntry>) -> anyhow::Result<()> {
+        let h = &self.header;
+        for e in dir {
+            if e.run_length == 0 {
+                let leaf = self.read_directory(h.leaf_dirs_offset + e.offset, e.length as u64)?;
+                self.walk(&leaf, out)?;
+            } else {
+                for k in 0..e.run_length as u64 {
+                    out.push(TileEntry {
+                        tile_id: e.tile_id + k,
+                        offset: h.tile_data_offset + e.offset,
+                        length: e.length,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_directory(&self, offset: u64, len: u64) -> anyhow::Result<Vec<DirEntry>> {
+        let raw = self.section(offset, len)?;
+        deserialize_directory(&self.decompress_internal(raw)?)
+    }
+
+    fn section(&self, offset: u64, len: u64) -> anyhow::Result<&[u8]> {
+        let end = offset.checked_add(len).context("section overflow")?;
+        if end > self.mmap.len() as u64 {
+            anyhow::bail!("section {offset}+{len} past end of file ({})", self.mmap.len());
+        }
+        Ok(&self.mmap[offset as usize..end as usize])
+    }
+
+    fn decompress_internal(&self, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+        if self.header.internal_compression == COMPRESSION_GZIP { gunzip(raw) } else { Ok(raw.to_vec()) }
+    }
+}
+
+pub fn gunzip(input: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::with_capacity(input.len() * 4);
+    flate2::read::GzDecoder::new(input).read_to_end(&mut out)?;
+    Ok(out)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tile_id_to_zxy_inverts_tile_id() {
+        for z in 0..=14u8 {
+            let n = 1u32 << z;
+            let step = (n / 37).max(1);
+            for x in (0..n).step_by(step as usize) {
+                for y in (0..n).step_by(step as usize) {
+                    assert_eq!(tile_id_to_zxy(tile_id(z, x, y)), (z, x, y));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reader_round_trips_writer_output_across_leaves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.pmtiles");
+        let mut w = PmtilesWriter::create(
+            &path, 0, 8, (-180.0, -85.0, 180.0, 85.0), "contour", "elevation", 40_000,
+        ).unwrap();
+        w.leaf_size = 1000; // force several leaves
+        let mut ids: Vec<(u8, u32, u32)> = Vec::new();
+        for x in 0..256u32 { for y in (0..256u32).step_by(3) { ids.push((8, x, y)); } }
+        ids.sort_by_key(|&(z, x, y)| tile_id(z, x, y));
+        for &(z, x, y) in &ids {
+            w.add_tile(z, x, y, format!("{z}/{x}/{y}").as_bytes()).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let r = PmtilesReader::open(&path).unwrap();
+        let entries = r.entries().unwrap();
+        assert_eq!(entries.len(), ids.len());
+        for (e, &(z, x, y)) in entries.iter().zip(&ids) {
+            assert_eq!(e.tile_id, tile_id(z, x, y));
+            assert_eq!(gunzip(r.tile_bytes(e)).unwrap(), format!("{z}/{x}/{y}").as_bytes());
+        }
+    }
 
     #[test]
     fn varint_zero_is_one_byte() {

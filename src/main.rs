@@ -29,6 +29,18 @@ enum Cmd {
     Build(BuildArgs),
     /// Read tilemaker config.json + SHPs, write clustered PMTiles.
     Tile(TileArgs),
+    /// Compare two contour PMTiles tile by tile: same tile set, same lines
+    /// per (elevation, main, show) group. Line order inside a tile is ignored.
+    Compare(CompareArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct CompareArgs {
+    a: std::path::PathBuf,
+    b: std::path::PathBuf,
+    /// How many differing tiles to print.
+    #[arg(long, default_value = "10")]
+    show: usize,
 }
 
 #[derive(clap::Args, Debug)]
@@ -229,6 +241,7 @@ fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Build(a) => run_build(a),
         Cmd::Tile(a) => run_tile(a),
+        Cmd::Compare(a) => run_compare(a),
     }
 }
 
@@ -380,6 +393,97 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
     eprintln!("Wrote {} non-empty tiles", written);
     writer.finalize()?;
     Ok(())
+}
+
+fn run_compare(args: CompareArgs) -> anyhow::Result<()> {
+    use corrie::container::pmtiles::{gunzip, tile_id_to_zxy, PmtilesReader, TileEntry};
+    use std::collections::BTreeMap;
+
+    let ra = PmtilesReader::open(&args.a)?;
+    let rb = PmtilesReader::open(&args.b)?;
+    let ea = ra.entries()?;
+    let eb = rb.entries()?;
+
+    // Merge-join both entry lists (each sorted by tile_id).
+    let (mut only_a, mut only_b) = (Vec::new(), Vec::new());
+    let mut both: Vec<(TileEntry, TileEntry)> = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < ea.len() || j < eb.len() {
+        match (ea.get(i), eb.get(j)) {
+            (Some(a), Some(b)) if a.tile_id == b.tile_id => { both.push((*a, *b)); i += 1; j += 1; }
+            (Some(a), Some(b)) if a.tile_id < b.tile_id => { only_a.push(a.tile_id); i += 1; }
+            (Some(_), Some(b)) => { only_b.push(b.tile_id); j += 1; }
+            (Some(a), None) => { only_a.push(a.tile_id); i += 1; }
+            (None, Some(b)) => { only_b.push(b.tile_id); j += 1; }
+            (None, None) => unreachable!(),
+        }
+    }
+
+    // Canonical tile content: lines grouped by attributes, each group sorted.
+    type Canon = BTreeMap<(i32, bool, bool), Vec<Vec<(i32, i32)>>>;
+    let canon = |raw: &[u8]| -> anyhow::Result<Canon> {
+        let mut m = Canon::new();
+        for f in corrie::mvt::decode_tile(&gunzip(raw)?, "elevation")? {
+            m.entry((f.elevation, f.main, f.show)).or_default().extend(f.lines);
+        }
+        for lines in m.values_mut() { lines.sort(); }
+        Ok(m)
+    };
+    let count_pts = |c: &Canon| -> usize { c.values().flatten().map(|l| l.len()).sum() };
+
+    // Multiset inclusion of lines, group by group: is every line of `small` also in `big`?
+    let contains = |big: &Canon, small: &Canon| -> bool {
+        small.iter().all(|(k, ls)| {
+            let Some(bl) = big.get(k) else { return false };
+            let mut bi = bl.iter().peekable();
+            ls.iter().all(|l| {
+                while bi.peek().is_some_and(|b| *b < l) { bi.next(); }
+                bi.next_if(|b| *b == l).is_some()
+            })
+        })
+    };
+    // How a differing tile differs: a has extra lines, b has extra lines, or lines changed.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Diff { AExtra, BExtra, Changed }
+    let results: Vec<anyhow::Result<Option<(u64, usize, usize, Diff)>>> = both
+        .par_iter()
+        .map(|(a, b)| {
+            let (ba, bb) = (ra.tile_bytes(a), rb.tile_bytes(b));
+            if ba == bb { return Ok(None); }
+            let (ca, cb) = (canon(ba)?, canon(bb)?);
+            if ca == cb { return Ok(None); }
+            let kind = if contains(&ca, &cb) { Diff::AExtra } else if contains(&cb, &ca) { Diff::BExtra } else { Diff::Changed };
+            Ok(Some((a.tile_id, count_pts(&ca), count_pts(&cb), kind)))
+        })
+        .collect();
+    let mut differing = Vec::new();
+    for r in results { if let Some(d) = r? { differing.push(d); } }
+
+    let zxy = |id: u64| { let (z, x, y) = tile_id_to_zxy(id); format!("{z}/{x}/{y}") };
+    println!("tiles: a={} b={} common={}", ea.len(), eb.len(), both.len());
+    println!("only in a: {}{}", only_a.len(),
+        only_a.iter().take(args.show).map(|&id| format!(" {}", zxy(id))).collect::<String>());
+    println!("only in b: {}{}", only_b.len(),
+        only_b.iter().take(args.show).map(|&id| format!(" {}", zxy(id))).collect::<String>());
+    println!("common tiles with different lines: {}", differing.len());
+    for (kind, label) in [
+        (Diff::AExtra, "a has every line of b, plus more"),
+        (Diff::BExtra, "b has every line of a, plus more"),
+        (Diff::Changed, "lines changed (neither contains the other)"),
+    ] {
+        let of_kind: Vec<_> = differing.iter().filter(|d| d.3 == kind).collect();
+        if of_kind.is_empty() { continue; }
+        println!("  {label}: {}", of_kind.len());
+        for (id, pa, pb, _) in of_kind.iter().take(args.show) {
+            println!("    {}  points a={} b={}", zxy(*id), pa, pb);
+        }
+    }
+    if only_a.is_empty() && only_b.is_empty() && differing.is_empty() {
+        println!("IDENTICAL (same tiles, same lines)");
+        Ok(())
+    } else {
+        anyhow::bail!("archives differ")
+    }
 }
 
 fn run_build(args: BuildArgs) -> anyhow::Result<()> {

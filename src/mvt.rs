@@ -248,3 +248,85 @@ fn command(id: u32, count: u32) -> u32 {
 fn zigzag(n: i32) -> u32 {
     ((n << 1) ^ (n >> 31)) as u32
 }
+
+// ── Decoding (inverse of encode_tile) ───────────────────────────────────────
+
+/// Decode a raw (uncompressed) MVT produced by [`encode_tile`] back into
+/// contour features. Every layer is read; a feature's `elevation` comes from
+/// the `elevation_attr` tag, `main`/`show` are true when those keys are present.
+pub fn decode_tile(raw: &[u8], elevation_attr: &str) -> anyhow::Result<Vec<ContourFeature>> {
+    let tile = Tile::decode(raw)?;
+    let mut out = Vec::new();
+    for layer in &tile.layers {
+        for f in &layer.features {
+            let mut cf = ContourFeature { lines: Vec::new(), elevation: 0, main: false, show: false };
+            for kv in f.tags.chunks_exact(2) {
+                let key = layer.keys.get(kv[0] as usize).map(String::as_str);
+                let val = layer.values.get(kv[1] as usize);
+                match key {
+                    Some(k) if k == elevation_attr => {
+                        cf.elevation = val.and_then(|v| v.int_value.or(v.sint_value)).unwrap_or(0) as i32;
+                    }
+                    Some("main") => cf.main = true,
+                    Some("show") => cf.show = true,
+                    _ => {}
+                }
+            }
+            cf.lines = decode_lines(&f.geometry)?;
+            out.push(cf);
+        }
+    }
+    Ok(out)
+}
+
+fn decode_lines(cmds: &[u32]) -> anyhow::Result<Vec<Vec<(i32, i32)>>> {
+    let mut lines: Vec<Vec<(i32, i32)>> = Vec::new();
+    let (mut cx, mut cy) = (0i32, 0i32);
+    let mut i = 0;
+    while i < cmds.len() {
+        let id = cmds[i] & 0x7;
+        let count = (cmds[i] >> 3) as usize;
+        i += 1;
+        match id {
+            1 | 2 => {
+                if i + 2 * count > cmds.len() { anyhow::bail!("truncated geometry"); }
+                for _ in 0..count {
+                    cx += unzigzag(cmds[i]);
+                    cy += unzigzag(cmds[i + 1]);
+                    i += 2;
+                    if id == 1 { lines.push(Vec::new()); }
+                    lines.last_mut().ok_or_else(|| anyhow::anyhow!("LineTo before MoveTo"))?.push((cx, cy));
+                }
+            }
+            7 => {}
+            _ => anyhow::bail!("unknown geometry command {id}"),
+        }
+    }
+    Ok(lines)
+}
+
+#[inline]
+fn unzigzag(n: u32) -> i32 {
+    ((n >> 1) as i32) ^ -((n & 1) as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_inverts_encode() {
+        let features = vec![
+            ContourFeature { lines: vec![vec![(0, 0), (10, -5), (4096, 4100)], vec![(7, 7), (8, 9)]], elevation: 150, main: true, show: false },
+            ContourFeature { lines: vec![vec![(-64, 3), (2, 2)]], elevation: -20, main: false, show: false },
+            ContourFeature { lines: vec![vec![(1, 1), (2, 2)]], elevation: 300, main: true, show: true },
+        ];
+        let raw = encode_tile(&features, "contour", "elevation");
+        let back = decode_tile(&raw, "elevation").unwrap();
+        assert_eq!(back.len(), 3);
+        for (a, b) in features.iter().zip(&back) {
+            assert_eq!(a.lines, b.lines);
+            assert_eq!((a.elevation, a.main, a.show), (b.elevation, b.main, b.show));
+        }
+    }
+}
