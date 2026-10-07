@@ -16,8 +16,7 @@ fn tile_tiny_fixture_produces_pmtiles() {
     let sz = std::fs::metadata(&out).unwrap().len();
     assert!(sz > 200, "output suspiciously tiny: {} bytes", sz);
 
-    // Verify clustered byte. Per Task 28 finding, the actual offset is 96
-    // (not 121 as the original plan said).
+    // The `clustered` flag is byte 96 of the 127-byte PMTiles v3 header.
     let bytes = std::fs::read(&out).unwrap();
     assert_eq!(bytes[96], 1, "output must be clustered");
 }

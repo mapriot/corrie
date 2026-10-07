@@ -57,12 +57,12 @@ fn write_to_merges_into_target_layer() {
 
 #[test]
 fn parse_real_mapriot_config_if_present() {
-    let path = std::path::Path::new("/Users/patrikd/projects/mapriot/config-contours.json");
-    if !path.exists() {
-        eprintln!("skipping — mapriot config not at {:?}", path);
+    // Point CORRIE_REAL_CONFIG at mapriot's config-contours.json to run this.
+    let Some(path) = std::env::var_os("CORRIE_REAL_CONFIG") else {
+        eprintln!("skipping: CORRIE_REAL_CONFIG not set");
         return;
-    }
-    let sources = parse_and_resolve(path).expect("real config");
+    };
+    let sources = parse_and_resolve(std::path::Path::new(&path)).expect("real config");
     assert!(sources.len() >= 100, "expected many layers; got {}", sources.len());
     let all_writes_to_contour = sources.iter().all(|s| s.output_layer_name == "contour");
     assert!(all_writes_to_contour, "expected every layer to write_to=contour");

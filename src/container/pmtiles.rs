@@ -2,8 +2,7 @@
 //!
 //! Implements the PMTiles v3 spec end-to-end so that heap usage during
 //! tile-gen is bounded by one leaf's worth of `DirEntry` records plus
-//! a small root vec, independent of total tile count. See the design
-//! doc at `.claude/specs/2026-05-18-corrie-streaming-pmtiles-writer-design.md`.
+//! a small root vec, independent of total tile count.
 
 // ---------------- varint (LEB128 unsigned) ----------------
 

@@ -8,9 +8,8 @@
 //! message's features to the on-disk builder as they arrive.
 //!
 //! Memory model: peak RAM during ingest is bounded by `(num_workers +
-//! chan_cap) × max_shp_in_memory`. For a 480-SHP planet build at
-//! `-j 10`, that's roughly 20–30 GB peak — well under the prod-box
-//! 100 GB cgroup. The index adds to that: 24 B per indexed chunk while
+//! chan_cap) × max_shp_in_memory`. For a world-wide build of ~1,000
+//! SHPs at `-j 10` that is roughly 20–30 GB. The index adds to that: 24 B per indexed chunk while
 //! reading, then the R-tree built from it (~50 B per chunk) next to the
 //! list. Contour data has ~2.3 chunks per line (Madagascar).
 //!
@@ -23,7 +22,7 @@
 //!
 //! Earlier versions of this driver buffered out-of-order arrivals in a
 //! `BTreeMap` to preserve config order. That buffer grew unboundedly on
-//! large datasets and caused cgroup-OOM around the half-way mark of
+//! large datasets and ran out of memory around the half-way mark of
 //! planet ingest when a slow head-of-line SHP let dozens of GBs pile up
 //! behind it. Dropping the in-order constraint trades cross-run byte
 //! reproducibility for hard memory bounds.

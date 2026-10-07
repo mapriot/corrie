@@ -36,8 +36,6 @@ fn writer_produces_clustered_output() {
     //  97      internal_compression
     //  98      tile_compression
     //  99      tile_type
-    // (Note: the PMTiles v3 spec document says byte 121, but the actual offset
-    //  in this crate's serialisation is 96.)
     let bytes = std::fs::read(&path).unwrap();
     assert!(bytes.len() > 128, "header truncated");
     let clustered = bytes[96];
