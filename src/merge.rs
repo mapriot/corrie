@@ -31,70 +31,99 @@ pub struct MergeStats {
 
 /// Merge `inputs` into a new clustered archive at `output`.
 pub fn merge_archives(inputs: &[PathBuf], output: &Path, layer_name: &str, elevation_attr: &str) -> Result<MergeStats> {
-    if inputs.is_empty() { bail!("no inputs"); }
-    let readers: Vec<PmtilesReader> = inputs.iter().map(|p| PmtilesReader::open(p)).collect::<Result<_>>()?;
-    for (r, p) in readers.iter().zip(inputs) {
-        let h = r.header();
-        if h.tile_type != TILE_TYPE_MVT || h.tile_compression != COMPRESSION_GZIP {
-            bail!("{:?}: expected gzipped MVT tiles", p);
+    Merge::open(inputs)?.write(output, layer_name, elevation_attr, |_| Ok(()))
+}
+
+/// Opened inputs with their tiles grouped by tile_id, ready to write.
+pub struct Merge {
+    readers: Vec<PmtilesReader>,
+    /// (tile_id, input index, entry), sorted by tile_id then input.
+    all: Vec<(u64, u32, TileEntry)>,
+    /// Ranges of `all` that share a tile_id.
+    groups: Vec<std::ops::Range<usize>>,
+}
+
+impl Merge {
+    /// Open every input and read its directories.
+    pub fn open(inputs: &[PathBuf]) -> Result<Self> {
+        if inputs.is_empty() { bail!("no inputs"); }
+        let readers: Vec<PmtilesReader> = inputs.iter().map(|p| PmtilesReader::open(p)).collect::<Result<_>>()?;
+        for (r, p) in readers.iter().zip(inputs) {
+            let h = r.header();
+            if h.tile_type != TILE_TYPE_MVT || h.tile_compression != COMPRESSION_GZIP {
+                bail!("{:?}: expected gzipped MVT tiles", p);
+            }
         }
+
+        let mut all: Vec<(u64, u32, TileEntry)> = Vec::new();
+        for (i, r) in readers.iter().enumerate() {
+            all.extend(r.entries().with_context(|| format!("directories of {:?}", inputs[i]))?
+                .into_iter().map(|e| (e.tile_id, i as u32, e)));
+        }
+        all.par_sort_unstable_by_key(|&(id, i, _)| (id, i));
+        let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut s = 0;
+        for k in 1..=all.len() {
+            if k == all.len() || all[k].0 != all[s].0 {
+                groups.push(s..k);
+                s = k;
+            }
+        }
+        Ok(Self { readers, all, groups })
     }
 
-    // All (tile_id, input) pairs, grouped by tile_id.
-    let mut all: Vec<(u64, u32, TileEntry)> = Vec::new();
-    for (i, r) in readers.iter().enumerate() {
-        all.extend(r.entries().with_context(|| format!("directories of {:?}", inputs[i]))?
-            .into_iter().map(|e| (e.tile_id, i as u32, e)));
-    }
-    all.par_sort_unstable_by_key(|&(id, i, _)| (id, i));
-    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
-    let mut s = 0;
-    for k in 1..=all.len() {
-        if k == all.len() || all[k].0 != all[s].0 {
-            groups.push(s..k);
-            s = k;
-        }
-    }
+    /// Write the merged archive. `created` is called right after `output`
+    /// has been created (or truncated), before any tile is written.
+    pub fn write(
+        &self,
+        output: &Path,
+        layer_name: &str,
+        elevation_attr: &str,
+        created: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<MergeStats> {
+        let hs: Vec<_> = self.readers.iter().map(|r| r.header().clone()).collect();
+        let min_z = hs.iter().map(|h| h.min_zoom).min().unwrap();
+        let max_z = hs.iter().map(|h| h.max_zoom).max().unwrap();
+        let e7 = |v: i32| v as f64 / 1e7;
+        let bounds = (
+            e7(hs.iter().map(|h| h.min_lon_e7).min().unwrap()),
+            e7(hs.iter().map(|h| h.min_lat_e7).min().unwrap()),
+            e7(hs.iter().map(|h| h.max_lon_e7).max().unwrap()),
+            e7(hs.iter().map(|h| h.max_lat_e7).max().unwrap()),
+        );
+        let mut writer = PmtilesWriter::create(
+            output, min_z, max_z, bounds, layer_name, elevation_attr, self.groups.len() as u64,
+        )?;
+        created(output)?;
 
-    let hs: Vec<_> = readers.iter().map(|r| r.header().clone()).collect();
-    let min_z = hs.iter().map(|h| h.min_zoom).min().unwrap();
-    let max_z = hs.iter().map(|h| h.max_zoom).max().unwrap();
-    let e7 = |v: i32| v as f64 / 1e7;
-    let bounds = (
-        e7(hs.iter().map(|h| h.min_lon_e7).min().unwrap()),
-        e7(hs.iter().map(|h| h.min_lat_e7).min().unwrap()),
-        e7(hs.iter().map(|h| h.max_lon_e7).max().unwrap()),
-        e7(hs.iter().map(|h| h.max_lat_e7).max().unwrap()),
-    );
-    let mut writer = PmtilesWriter::create(output, min_z, max_z, bounds, layer_name, elevation_attr, groups.len() as u64)?;
-
-    let mut merged = 0u64;
-    const BATCH: usize = 16_384;
-    for batch in groups.chunks(BATCH) {
-        let out: Vec<Result<(u64, Cow<[u8]>)>> = batch
-            .par_iter()
-            .map(|g| {
-                let parts = &all[g.clone()];
-                let id = parts[0].0;
-                if parts.len() == 1 {
-                    let (_, i, e) = parts[0];
-                    return Ok((id, Cow::Borrowed(readers[i as usize].tile_bytes(&e))));
-                }
-                let raws: Vec<Vec<u8>> = parts.iter()
-                    .map(|&(_, i, e)| gunzip(readers[i as usize].tile_bytes(&e)))
-                    .collect::<Result<_>>()?;
-                let mvt = merge_tiles(&raws, layer_name, elevation_attr)?;
-                Ok((id, Cow::Owned(gzip_tile(&mvt)?)))
-            })
-            .collect();
-        for (r, g) in out.into_iter().zip(batch) {
-            let (id, bytes) = r?;
-            if g.len() > 1 { merged += 1; }
-            writer.add_tile_gzipped(id, &bytes)?;
+        let mut merged = 0u64;
+        const BATCH: usize = 16_384;
+        for batch in self.groups.chunks(BATCH) {
+            let out: Vec<Result<(u64, Cow<[u8]>)>> = batch
+                .par_iter()
+                .map(|g| {
+                    let parts = &self.all[g.clone()];
+                    let id = parts[0].0;
+                    if parts.len() == 1 {
+                        let (_, i, e) = parts[0];
+                        return Ok((id, Cow::Borrowed(self.readers[i as usize].tile_bytes(&e))));
+                    }
+                    let raws: Vec<Vec<u8>> = parts.iter()
+                        .map(|&(_, i, e)| gunzip(self.readers[i as usize].tile_bytes(&e)))
+                        .collect::<Result<_>>()?;
+                    let mvt = merge_tiles(&raws, layer_name, elevation_attr)?;
+                    Ok((id, Cow::Owned(gzip_tile(&mvt)?)))
+                })
+                .collect();
+            for (r, g) in out.into_iter().zip(batch) {
+                let (id, bytes) = r?;
+                if g.len() > 1 { merged += 1; }
+                writer.add_tile_gzipped(id, &bytes)?;
+            }
         }
+        writer.finalize()?;
+        Ok(MergeStats { tiles: self.groups.len() as u64, merged })
     }
-    writer.finalize()?;
-    Ok(MergeStats { tiles: groups.len() as u64, merged })
 }
 
 /// Merge raw (uncompressed) contour MVTs into one: lines with the same

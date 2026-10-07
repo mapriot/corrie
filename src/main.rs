@@ -295,6 +295,7 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
             corrie::temp_cache::reap_orphan_caches();
             let td = corrie::temp_cache::create_ephemeral_cache()?;
             let path = td.path().to_path_buf();
+            corrie::cleanup::remove_on_signal(&path)?;
             _temp_cache = Some(td);
             (path, false)
         }
@@ -366,6 +367,7 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
         &args.output, cfg.settings.minzoom, cfg.settings.maxzoom,
         (w, s, e, n), &output_layer, "elevation", tiles.len() as u64,
     )?;
+    corrie::cleanup::remove_on_signal(&args.output)?;
 
     // Parallel tile-gen via rayon, serial write through the PMTiles writer
     // (the writer's clustered=true layout requires monotonically increasing
@@ -411,6 +413,7 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
     pb.finish();
     eprintln!("Wrote {} non-empty tiles", written);
     writer.finalize()?;
+    corrie::cleanup::forget_on_signal(&args.output);
     Ok(())
 }
 
@@ -419,7 +422,9 @@ fn run_merge(args: MergeArgs) -> anyhow::Result<()> {
         rayon::ThreadPoolBuilder::new().num_threads(w).build_global().context("rayon")?;
     }
     let t0 = std::time::Instant::now();
-    let stats = corrie::merge::merge_archives(&args.inputs, &args.output, &args.layer, "elevation")?;
+    let merge = corrie::merge::Merge::open(&args.inputs)?;
+    let stats = merge.write(&args.output, &args.layer, "elevation", |out| corrie::cleanup::remove_on_signal(out))?;
+    corrie::cleanup::forget_on_signal(&args.output);
     eprintln!("Merged {} archives: {} tiles, {} present in several inputs, in {:.1}s",
         args.inputs.len(), stats.tiles, stats.merged, t0.elapsed().as_secs_f64());
     Ok(())

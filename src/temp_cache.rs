@@ -2,8 +2,9 @@
 //!
 //! When `corrie tile` runs without `--cache-dir`, the feature store lives
 //! in a temp directory tagged with the corrie process's PID. `TempDir`'s
-//! `Drop` impl removes the directory on clean scope exit, but does not run
-//! on SIGKILL / OOM / SIGTERM — so a kill leaves the directory behind.
+//! `Drop` impl removes the directory on clean scope exit; `cleanup` removes
+//! it on Ctrl+C / SIGTERM / SIGHUP. SIGKILL and OOM kills still leave it
+//! behind.
 //!
 //! On startup we scan the system temp dir for sibling `corrie-cache-<pid>-*`
 //! entries whose PID is no longer alive, and reap them. PID-based liveness

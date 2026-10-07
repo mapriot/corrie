@@ -577,8 +577,9 @@ impl PmtilesWriter {
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&serialize_header(&header))?;
 
-        // 8. Flush + close.
+        // 8. Flush and sync: an archive that looks finished must be on disk.
         self.file.flush().context("flush final pmtiles writer")?;
+        self.file.get_ref().sync_all().context("sync pmtiles file")?;
         Ok(())
     }
 }
