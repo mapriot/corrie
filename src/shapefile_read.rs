@@ -34,11 +34,16 @@ pub struct ReadFeature {
 /// Reads the column named by `elevation_field` from the DBF and floors it
 /// into an i16. Records of unsupported geometry types fail the whole shp.
 /// Records with null elevation are skipped with a warning to stderr.
+///
+/// With `drop_seams`, a feature whose every vertex (over all its parts) lies
+/// within that many degrees of a whole-degree meridian or parallel is
+/// skipped (see [`on_degree_seams`]). Returns the number of such features.
 pub fn read_polylines_streaming<F>(
     shp_path: &Path,
     elevation_field: &str,
+    drop_seams: Option<f64>,
     mut emit: F,
-) -> Result<()>
+) -> Result<u64>
 where
     F: FnMut(ReadFeature) -> Result<()>,
 {
@@ -60,6 +65,7 @@ where
     };
 
     let mut rec_idx: u64 = 0;
+    let mut dropped: u64 = 0;
     for feature in layer.features() {
         let elev_f64 = match feature.field_as_double(elev_idx) {
             Ok(Some(v)) => v,
@@ -87,13 +93,20 @@ where
         let flat = gdal::vector::geometry_type_flatten(geom.geometry_type());
         match flat {
             OGRwkbGeometryType::wkbLineString => {
-                emit_linestring(geom, elevation, &mut emit)?;
+                if drop_seams.is_some_and(|t| on_degree_seams(points(geom), t)) {
+                    dropped += 1;
+                } else {
+                    emit_linestring(geom, elevation, &mut emit)?;
+                }
             }
             OGRwkbGeometryType::wkbMultiLineString => {
-                let n = geom.geometry_count();
-                for i in 0..n {
-                    let sub = geom.get_geometry(i);
-                    emit_linestring(&sub, elevation, &mut emit)?;
+                let parts: Vec<_> = (0..geom.geometry_count()).map(|i| geom.get_geometry(i)).collect();
+                if drop_seams.is_some_and(|t| on_degree_seams(parts.iter().flat_map(|p| points(p)), t)) {
+                    dropped += 1;
+                } else {
+                    for sub in &parts {
+                        emit_linestring(sub, elevation, &mut emit)?;
+                    }
                 }
             }
             _ => {
@@ -106,7 +119,30 @@ where
         }
         rec_idx += 1;
     }
-    Ok(())
+    Ok(dropped)
+}
+
+/// The `(x, y)` vertices of a LineString.
+fn points(geom: &Geometry) -> impl Iterator<Item = (f64, f64)> + '_ {
+    (0..geom.point_count()).map(move |i| { let (x, y, _) = geom.get_point(i as i32); (x, y) })
+}
+
+/// Does every one of at least two vertices lie within `t` degrees of a
+/// whole-degree meridian (in `x`) or parallel (in `y`)? Contour lines like
+/// that run along the seams of 1° DEM tiles (e.g. JAXA AW3D30), where one
+/// tile's data meets nodata, rather than along the terrain.
+pub fn on_degree_seams(points: impl IntoIterator<Item = (f64, f64)>, t: f64) -> bool {
+    let near = |v: f64| {
+        let mut frac = (v - v.trunc()).abs();
+        if frac > 0.5 { frac = 1.0 - frac; }
+        frac < t
+    };
+    let mut n = 0;
+    for (x, y) in points {
+        if !near(x) && !near(y) { return false; }
+        n += 1;
+    }
+    n >= 2
 }
 
 fn emit_linestring<F>(geom: &Geometry, elevation: i16, emit: &mut F) -> Result<()>
@@ -123,4 +159,27 @@ where
     }
 
     emit(ReadFeature { coords, elevation })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::on_degree_seams;
+
+    #[test]
+    fn degree_seam_lines() {
+        let t = 0.001;
+        // along a meridian, and along a parallel (either side of the line)
+        assert!(on_degree_seams([(-78.9995, -1.2), (-79.0004, -1.5), (-78.9999, -1.9)], t));
+        assert!(on_degree_seams([(14.2, 50.0002), (14.7, 49.9993)], t));
+        // a staircase along both, across a corner
+        assert!(on_degree_seams([(15.0003, 49.6), (15.0003, 50.0001), (15.4, 50.0001)], t));
+        // one vertex off the seams keeps the line
+        assert!(!on_degree_seams([(15.0003, 49.6), (15.2, 49.7), (15.4, 50.0001)], t));
+        // just past the threshold, and half a degree, the farthest there is
+        assert!(!on_degree_seams([(15.0011, 49.6), (14.9989, 49.7)], t));
+        assert!(!on_degree_seams([(15.5, 49.5), (15.5, 49.6)], t));
+        // fewer than two vertices is never a seam line
+        assert!(!on_degree_seams([(15.0, 50.0)], t));
+        assert!(!on_degree_seams(std::iter::empty(), t));
+    }
 }

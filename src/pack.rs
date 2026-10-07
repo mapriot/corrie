@@ -189,6 +189,17 @@ pub struct PackStats {
     pub lines: u64,
     pub vertices: u64,
     pub bytes: u64,
+    /// Source features left out as degree-seam lines (`--drop-seams`).
+    pub seam_features: u64,
+}
+
+/// How sources are packed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PackOptions {
+    /// Leave out features whose every vertex lies within this many degrees of
+    /// a whole-degree meridian or parallel (see
+    /// [`crate::shapefile_read::on_degree_seams`]).
+    pub drop_seams: Option<f64>,
 }
 
 /// Streams lines into a pack. Data is written as lines arrive; the line and
@@ -310,15 +321,16 @@ impl PackWriter {
         self.file.write_all(bytemuck::bytes_of(&header))?;
         self.file.flush()?;
         self.file.get_ref().sync_all()?;
-        Ok(PackStats { lines: header.n_lines, vertices: self.n_vertices, bytes: pos })
+        Ok(PackStats { lines: header.n_lines, vertices: self.n_vertices, bytes: pos, seam_features: 0 })
     }
 }
 
 /// Pack the polylines of a GDAL-readable vector file (SHP, FlatGeobuf,
-/// GeoPackage, …) into `out`. `meta` gets the source's path and size/mtime.
-pub fn pack_vector_file(source: &Path, elevation_field: &str, out: &Path) -> Result<PackStats> {
+/// GeoPackage, …) into `out`. `meta` gets the source's path and size/mtime
+/// and the options.
+pub fn pack_vector_file(source: &Path, elevation_field: &str, out: &Path, opts: &PackOptions) -> Result<PackStats> {
     let mut w = PackWriter::create(out)?;
-    crate::shapefile_read::read_polylines_streaming(source, elevation_field, |f| {
+    let seam_features = crate::shapefile_read::read_polylines_streaming(source, elevation_field, opts.drop_seams, |f| {
         w.add_line(&f.coords, f.elevation)
     }).with_context(|| format!("read {:?}", source))?;
     let m = std::fs::metadata(source).with_context(|| format!("stat {:?}", source))?;
@@ -327,39 +339,42 @@ pub fn pack_vector_file(source: &Path, elevation_field: &str, out: &Path) -> Res
         "source_size": m.len(),
         "source_mtime_ns": mtime_ns(&m).to_string(),
         "elevation_field": elevation_field,
+        "drop_seams": opts.drop_seams,
         "corrie": env!("CARGO_PKG_VERSION"),
     });
-    w.finish(&meta)
+    Ok(PackStats { seam_features, ..w.finish(&meta)? })
 }
 
 /// Does the pack at `pack` hold `source` as it is now (same path, size,
-/// modification time and elevation field)?
-pub fn is_current(pack: &Path, source: &Path, field: &str) -> bool {
+/// modification time, elevation field and options)?
+pub fn is_current(pack: &Path, source: &Path, field: &str, opts: &PackOptions) -> bool {
     let (Ok(p), Ok(m)) = (Pack::open(pack), std::fs::metadata(source)) else { return false };
     let Ok(meta) = p.meta() else { return false };
     meta["source"].as_str() == Some(&*source.to_string_lossy())
         && meta["source_size"].as_u64() == Some(m.len())
         && meta["source_mtime_ns"].as_str() == Some(&*mtime_ns(&m).to_string())
         && meta["elevation_field"].as_str() == Some(field)
+        && meta["drop_seams"].as_f64() == opts.drop_seams
 }
 
 /// Pack several sources in parallel: (source, elevation field, output pack).
 /// Each pack is written as `<output>.partial` and renamed when complete.
-pub fn pack_files(jobs: &[(PathBuf, String, PathBuf)]) -> Result<()> {
+/// Returns the number of source features left out as degree-seam lines.
+pub fn pack_files(jobs: &[(PathBuf, String, PathBuf)], opts: &PackOptions) -> Result<u64> {
     use indicatif::{ProgressBar, ProgressStyle};
     use rayon::prelude::*;
     let pb = ProgressBar::new(jobs.len() as u64);
     pb.set_style(ProgressStyle::with_template(
         "[{elapsed_precise}] {bar:45.green/blue} {pos:>4}/{len} sources  eta {eta}").unwrap());
-    jobs.par_iter().try_for_each(|(source, field, out)| -> Result<()> {
+    let seams = jobs.par_iter().map(|(source, field, out)| -> Result<u64> {
         let partial = crate::cleanup::PartialOutput::new(out)?;
-        pack_vector_file(source, field, partial.path())?;
+        let stats = pack_vector_file(source, field, partial.path(), opts)?;
         partial.commit()?;
         pb.inc(1);
-        Ok(())
-    })?;
+        Ok(stats.seam_features)
+    }).try_reduce(|| 0, |a, b| Ok(a + b))?;
     pb.finish_and_clear();
-    Ok(())
+    Ok(seams)
 }
 
 pub fn mtime_ns(m: &std::fs::Metadata) -> u128 {
@@ -506,6 +521,39 @@ impl Pack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// --drop-seams decides per feature, over all its parts: a MultiLineString
+    /// with one part off the seams is kept whole.
+    #[test]
+    fn drop_seams_leaves_out_whole_seam_features() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lines.geojson");
+        let f = |elev: i32, geom: &str| format!(r#"{{"type":"Feature","properties":{{"elevation":{elev}}},"geometry":{geom}}}"#);
+        let features = [
+            f(100, r#"{"type":"LineString","coordinates":[[-79.0004,-1.2],[-78.9998,-1.6]]}"#),
+            f(110, r#"{"type":"MultiLineString","coordinates":[[[-79.0004,-1.2],[-78.9998,-1.6]],[[-78.5,-2.0003],[-78.4,-1.9998]]]}"#),
+            f(120, r#"{"type":"MultiLineString","coordinates":[[[-79.0004,-1.2],[-78.9998,-1.6]],[[-78.5,-1.5],[-78.4,-1.4]]]}"#),
+            f(130, r#"{"type":"LineString","coordinates":[[-78.6,-1.3],[-78.5,-1.2]]}"#),
+        ];
+        std::fs::write(&src, format!(r#"{{"type":"FeatureCollection","features":[{}]}}"#, features.join(","))).unwrap();
+
+        let plain = dir.path().join("plain.cpk");
+        let all = pack_vector_file(&src, "elevation", &plain, &PackOptions::default()).unwrap();
+        assert_eq!((all.lines, all.seam_features), (6, 0));
+
+        let opts = PackOptions { drop_seams: Some(0.001) };
+        let out = dir.path().join("seams.cpk");
+        let kept = pack_vector_file(&src, "elevation", &out, &opts).unwrap();
+        assert_eq!((kept.lines, kept.seam_features), (3, 2));
+        let pack = Pack::open(&out).unwrap();
+        let elevations: Vec<i16> = pack.lines().iter().map(|l| l.elevation).collect();
+        assert_eq!(elevations, vec![120, 120, 130]);
+
+        // the option is part of what makes a pack current
+        assert!(is_current(&out, &src, "elevation", &opts));
+        assert!(!is_current(&out, &src, "elevation", &PackOptions::default()));
+        assert!(is_current(&plain, &src, "elevation", &PackOptions::default()));
+    }
 
     struct Rng(u64);
     impl Rng {

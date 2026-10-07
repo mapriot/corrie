@@ -4,7 +4,7 @@ use corrie::shapefile_read::{read_polylines_streaming, ReadFeature};
 
 fn read_all(path: &std::path::Path, field: &str) -> Vec<ReadFeature> {
     let mut out = Vec::new();
-    read_polylines_streaming(path, field, |f| { out.push(f); Ok(()) }).expect("read");
+    read_polylines_streaming(path, field, None, |f| { out.push(f); Ok(()) }).expect("read");
     out
 }
 

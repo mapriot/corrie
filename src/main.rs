@@ -89,6 +89,11 @@ struct PackArgs {
     /// source_columns, or elevation)
     #[arg(long, default_value = "elevation")]
     field: String,
+    /// Leave out lines whose every vertex lies within DEG degrees of a
+    /// whole-degree meridian or parallel: contours traced along the seams of
+    /// 1° DEM tiles such as JAXA AW3D30, where data meets nodata (e.g. 0.001)
+    #[arg(long, value_name = "DEG")]
+    drop_seams: Option<f64>,
     /// Pack again even when an up-to-date pack exists
     #[arg(long)]
     force: bool,
@@ -462,7 +467,7 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<()> {
 }
 
 fn run_pack(args: PackArgs) -> anyhow::Result<()> {
-    use corrie::pack::{is_current, pack_files};
+    use corrie::pack::{is_current, pack_files, PackOptions};
     use std::path::{Path, PathBuf};
 
     if let Some(w) = args.workers {
@@ -505,11 +510,15 @@ fn run_pack(args: PackArgs) -> anyhow::Result<()> {
             anyhow::bail!("two sources would write {:?} (e.g. {:?}); rename one", out, src);
         }
     }
-    let todo: Vec<_> = all.iter().filter(|(src, field, out)| args.force || !is_current(out, src, field)).cloned().collect();
+    let opts = PackOptions { drop_seams: args.drop_seams };
+    let todo: Vec<_> = all.iter().filter(|(src, field, out)| args.force || !is_current(out, src, field, &opts)).cloned().collect();
     let t0 = std::time::Instant::now();
     if !todo.is_empty() {
         corrie::log!("Packing {} sources ({} already up to date) ...", todo.len(), all.len() - todo.len());
-        pack_files(&todo)?;
+        let seams = pack_files(&todo, &opts)?;
+        if opts.drop_seams.is_some() {
+            corrie::log!("Left out {} lines along degree seams", seams);
+        }
     }
     let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
     let source_bytes: u64 = all.iter().map(|(src, _, _)| {
