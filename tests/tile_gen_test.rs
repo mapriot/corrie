@@ -74,21 +74,29 @@ fn hilbert_sort_is_deterministic_and_orders_by_id() {
 }
 
 use corrie::tile_gen::enumerate_tiles_pruned;
-use corrie::spatial_index::{build_rtree, FeatureBbox};
+use corrie::pack::{Pack, PackWriter};
+
+/// One pack holding `lines` of (lon, lat) WGS84 vertices.
+fn pack_of(lines: &[Vec<[f64; 2]>]) -> (tempfile::TempDir, Pack) {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("t.cpk");
+    let mut w = PackWriter::create(&p).unwrap();
+    for l in lines {
+        let latp: Vec<[f64; 2]> = l.iter().map(|c| [c[0], corrie::mercator::lat2latp(c[1])]).collect();
+        w.add_line(&latp, 100).unwrap();
+    }
+    w.finish(&serde_json::json!({})).unwrap();
+    let pack = Pack::open(&p).unwrap();
+    (dir, pack)
+}
 
 #[test]
 fn pruned_subset_of_unpruned() {
-    // Place one feature bbox in roughly the Prague tile area at z=11.
-    let boxes = vec![FeatureBbox {
-        idx: 0,
-        chunk: 0,
-        min: [14.3_f32, corrie::mercator::lat2latp(50.0) as f32],
-        max: [14.5_f32, corrie::mercator::lat2latp(50.1) as f32],
-    }];
-    let rtree = build_rtree(boxes);
+    // One short line in roughly the Prague tile area at z=11.
+    let (_d, pack) = pack_of(&[vec![[14.3, 50.0], [14.5, 50.1]]]);
     let bbox = [14.0, 49.9, 14.6, 50.2];
     let unpruned = enumerate_tiles(bbox, 11, 13);
-    let pruned   = enumerate_tiles_pruned(&rtree, bbox, 11, 13);
+    let pruned   = enumerate_tiles_pruned(std::slice::from_ref(&pack), bbox, 11, 13);
 
     use std::collections::HashSet;
     let u: HashSet<_> = unpruned.iter().copied().collect();
@@ -103,7 +111,7 @@ fn pruned_subset_of_unpruned() {
 
 #[test]
 fn pruned_world_with_no_features_is_empty() {
-    let rtree = build_rtree(Vec::<FeatureBbox>::new());
-    let tiles = enumerate_tiles_pruned(&rtree, [-180.0, -85.0, 180.0, 85.0], 0, 5);
-    assert!(tiles.is_empty(), "empty tree must yield zero tiles");
+    let (_d, pack) = pack_of(&[]);
+    let tiles = enumerate_tiles_pruned(std::slice::from_ref(&pack), [-180.0, -85.0, 180.0, 85.0], 0, 5);
+    assert!(tiles.is_empty(), "empty pack must yield zero tiles");
 }

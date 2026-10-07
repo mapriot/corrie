@@ -1,24 +1,26 @@
-//! One tiling run: SHP sources → feature store cache → clustered PMTiles.
+//! One tiling run: sources → packs → clustered PMTiles.
 //! Used by `corrie tile` directly, and once per group by `shards`.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use rayon::prelude::*;
+use sha2::{Digest, Sha256};
 
 use crate::cleanup::PartialOutput;
 use crate::config::{Settings, SourceLayer};
 use crate::container::pmtiles::{gzip_tile, tile_id, PmtilesWriter};
-use crate::feature_store::{cache_valid, Reader};
-use crate::spatial_index::load_rtree;
+use crate::pack::{mtime_ns, pack_vector_file, Pack};
 use crate::tile_gen::{enumerate_tiles_pruned, hilbert_sort, process_tile};
 
-/// Where the feature store cache lives during a run.
+/// Where packs of the sources that are not packs already (SHP, FlatGeobuf,
+/// GeoPackage, …) are written for a run.
 pub enum Cache<'a> {
     /// A temp dir deleted when the run ends (or is stopped with a signal).
     Ephemeral,
-    /// A kept directory, reused while its SHPs are unchanged.
+    /// A kept directory: a source's pack is reused while the source's size
+    /// and modification time are unchanged.
     Persistent { dir: &'a Path, rebuild: bool },
 }
 
@@ -39,13 +41,13 @@ pub fn tile_sources(
     cache: Cache,
     metadata: &[(&str, serde_json::Value)],
 ) -> Result<TileStats> {
-    // Hold the TempDir for the whole run so the cache survives until tile
+    // Hold the TempDir for the whole run so the packs survive until tile
     // generation completes.
     let _temp_cache: Option<tempfile::TempDir>;
-    let (cache_dir, persistent, rebuild): (PathBuf, bool, bool) = match cache {
+    let (cache_dir, reuse): (PathBuf, bool) = match cache {
         Cache::Persistent { dir, rebuild } => {
             _temp_cache = None;
-            (dir.to_path_buf(), true, rebuild)
+            (dir.to_path_buf(), !rebuild)
         }
         Cache::Ephemeral => {
             crate::temp_cache::reap_orphan_caches();
@@ -53,33 +55,21 @@ pub fn tile_sources(
             crate::cleanup::remove_on_signal(td.path())?;
             let path = td.path().to_path_buf();
             _temp_cache = Some(td);
-            (path, false, false)
+            (path, false)
         }
     };
 
-    let shp_paths: Vec<PathBuf> = sources.iter().map(|s| s.shp_path.clone()).collect();
-    let mut stats = TileStats { features: 0, vertices: 0, tiles: 0 };
-    if !persistent || rebuild || !cache_valid(&cache_dir, &shp_paths) {
-        if persistent {
-            crate::log!("Ingesting {} SHPs into {:?} ...", shp_paths.len(), cache_dir);
-        } else {
-            crate::log!("Ingesting {} SHPs (temp cache, removed at the end) ...", shp_paths.len());
-        }
-        let t0 = std::time::Instant::now();
-        let s = crate::ingest::run(sources, &cache_dir)?;
-        crate::log!("Ingested {} features ({} vertices) in {:.2}s",
-            s.features, s.vertices, t0.elapsed().as_secs_f64());
-        (stats.features, stats.vertices) = (s.features, s.vertices);
-    } else {
-        crate::log!("Using cached feature store in {:?}", cache_dir);
-    }
-
-    let reader = Reader::open(&cache_dir)?;
-    let rtree = load_rtree(&cache_dir)?;
+    let packs = packs_for(sources, &cache_dir, reuse)?;
+    let mut stats = TileStats {
+        features: packs.iter().map(|p| p.header().n_lines).sum(),
+        vertices: packs.iter().map(|p| p.header().n_vertices).sum(),
+        tiles: 0,
+    };
 
     // Only tiles that hold data, within the lowest-zoom tiles that intersect
     // the config's bounding box (mapriot's is the whole world).
-    let mut tiles = enumerate_tiles_pruned(&rtree, settings.bounding_box, settings.minzoom, settings.maxzoom);
+    crate::log!("Listing tiles ...");
+    let mut tiles = enumerate_tiles_pruned(&packs, settings.bounding_box, settings.minzoom, settings.maxzoom);
     if tiles.is_empty() {
         crate::log!("No data within the config's bounding_box; nothing to do.");
     }
@@ -117,7 +107,7 @@ pub fn tile_sources(
         let results: Vec<Result<Option<Vec<u8>>>> = chunk
             .par_iter()
             .map(|&t| {
-                let r = process_tile(t, &reader, &rtree, sources, layer_name, "elevation")
+                let r = process_tile(t, &packs, sources, layer_name, "elevation")
                     .map(|mvt| gzip_tile(&mvt))
                     .transpose();
                 pb.inc(1);
@@ -142,4 +132,63 @@ pub fn tile_sources(
         crate::cleanup::forget_on_signal(&path);
     }
     Ok(stats)
+}
+
+/// Is this source a corrie pack (used as it is)?
+pub fn is_pack(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("cpk"))
+}
+
+/// One pack per source, in source order. Pack sources are opened as they
+/// are; any other source is packed into `cache_dir` (in parallel), or with
+/// `reuse` its earlier pack there is used while the source is unchanged.
+pub fn packs_for(sources: &[SourceLayer], cache_dir: &Path, reuse: bool) -> Result<Vec<Pack>> {
+    std::fs::create_dir_all(cache_dir).with_context(|| format!("create {:?}", cache_dir))?;
+    let field = |s: &SourceLayer| s.source_columns.first().cloned().unwrap_or_else(|| "elevation".to_string());
+    let paths: Vec<PathBuf> = sources.iter().map(|s| {
+        if is_pack(&s.shp_path) { s.shp_path.clone() } else { cache_dir.join(cached_pack_name(&s.shp_path)) }
+    }).collect();
+    let todo: Vec<usize> = (0..sources.len())
+        .filter(|&i| !is_pack(&sources[i].shp_path))
+        .filter(|&i| !(reuse && pack_is_current(&paths[i], &sources[i].shp_path, &field(&sources[i]))))
+        .collect();
+
+    if !todo.is_empty() {
+        crate::log!("Packing {} of {} sources into {:?} ...", todo.len(), sources.len(), cache_dir);
+        let t0 = std::time::Instant::now();
+        let pb = ProgressBar::new(todo.len() as u64);
+        pb.set_style(ProgressStyle::with_template(
+            "[{elapsed_precise}] {bar:45.green/blue} {pos:>4}/{len} sources  eta {eta}").unwrap());
+        todo.par_iter().try_for_each(|&i| -> Result<()> {
+            let out = PartialOutput::new(&paths[i])?;
+            pack_vector_file(&sources[i].shp_path, &field(&sources[i]), out.path())?;
+            out.commit()?;
+            pb.inc(1);
+            Ok(())
+        })?;
+        pb.finish_and_clear();
+        crate::log!("Packed {} sources in {:.1}s", todo.len(), t0.elapsed().as_secs_f64());
+    } else if sources.iter().any(|s| !is_pack(&s.shp_path)) {
+        crate::log!("Using the packs in {:?}", cache_dir);
+    }
+    paths.iter().map(|p| Pack::open(p)).collect()
+}
+
+/// The cache file name of a source's pack: its stem plus a hash of its full
+/// path, so two sources with the same file name never share a pack.
+fn cached_pack_name(source: &Path) -> String {
+    let full = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let h = Sha256::digest(full.to_string_lossy().as_bytes());
+    let stem = source.file_stem().unwrap_or_default().to_string_lossy();
+    format!("{}-{:02x}{:02x}{:02x}{:02x}.cpk", stem, h[0], h[1], h[2], h[3])
+}
+
+/// Does `pack` hold `source` as it is now (same path, size, mtime, field)?
+fn pack_is_current(pack: &Path, source: &Path, field: &str) -> bool {
+    let (Ok(p), Ok(m)) = (Pack::open(pack), std::fs::metadata(source)) else { return false };
+    let Ok(meta) = p.meta() else { return false };
+    meta["source"].as_str() == Some(&*source.to_string_lossy())
+        && meta["source_size"].as_u64() == Some(m.len())
+        && meta["source_mtime_ns"].as_str() == Some(&*mtime_ns(&m).to_string())
+        && meta["elevation_field"].as_str() == Some(field)
 }

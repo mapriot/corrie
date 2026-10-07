@@ -33,7 +33,7 @@ use crate::merge::Merge;
 /// Bump whenever a change makes corrie write different tiles for the same
 /// input (clipping, simplification, attributes, encoding), so group
 /// archives built by an older corrie are rebuilt instead of reused.
-pub const TILING_VERSION: u32 = 1;
+pub const TILING_VERSION: u32 = 2;
 
 /// Metadata field that holds a group archive's name and key.
 const META_FIELD: &str = "corrie_shard";
