@@ -332,6 +332,36 @@ pub fn pack_vector_file(source: &Path, elevation_field: &str, out: &Path) -> Res
     w.finish(&meta)
 }
 
+/// Does the pack at `pack` hold `source` as it is now (same path, size,
+/// modification time and elevation field)?
+pub fn is_current(pack: &Path, source: &Path, field: &str) -> bool {
+    let (Ok(p), Ok(m)) = (Pack::open(pack), std::fs::metadata(source)) else { return false };
+    let Ok(meta) = p.meta() else { return false };
+    meta["source"].as_str() == Some(&*source.to_string_lossy())
+        && meta["source_size"].as_u64() == Some(m.len())
+        && meta["source_mtime_ns"].as_str() == Some(&*mtime_ns(&m).to_string())
+        && meta["elevation_field"].as_str() == Some(field)
+}
+
+/// Pack several sources in parallel: (source, elevation field, output pack).
+/// Each pack is written as `<output>.partial` and renamed when complete.
+pub fn pack_files(jobs: &[(PathBuf, String, PathBuf)]) -> Result<()> {
+    use indicatif::{ProgressBar, ProgressStyle};
+    use rayon::prelude::*;
+    let pb = ProgressBar::new(jobs.len() as u64);
+    pb.set_style(ProgressStyle::with_template(
+        "[{elapsed_precise}] {bar:45.green/blue} {pos:>4}/{len} sources  eta {eta}").unwrap());
+    jobs.par_iter().try_for_each(|(source, field, out)| -> Result<()> {
+        let partial = crate::cleanup::PartialOutput::new(out)?;
+        pack_vector_file(source, field, partial.path())?;
+        partial.commit()?;
+        pb.inc(1);
+        Ok(())
+    })?;
+    pb.finish_and_clear();
+    Ok(())
+}
+
 pub fn mtime_ns(m: &std::fs::Metadata) -> u128 {
     m.modified().ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())

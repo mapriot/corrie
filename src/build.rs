@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::cleanup::PartialOutput;
 use crate::config::{Settings, SourceLayer};
 use crate::container::pmtiles::{gzip_tile, tile_id, PmtilesWriter};
-use crate::pack::{mtime_ns, pack_vector_file, Pack};
+use crate::pack::{is_current, pack_files, Pack};
 use crate::tile_gen::{enumerate_tiles_pruned, hilbert_sort, process_tile};
 
 /// Where packs of the sources that are not packs already (SHP, FlatGeobuf,
@@ -150,23 +150,16 @@ pub fn packs_for(sources: &[SourceLayer], cache_dir: &Path, reuse: bool) -> Resu
     }).collect();
     let todo: Vec<usize> = (0..sources.len())
         .filter(|&i| !is_pack(&sources[i].shp_path))
-        .filter(|&i| !(reuse && pack_is_current(&paths[i], &sources[i].shp_path, &field(&sources[i]))))
+        .filter(|&i| !(reuse && is_current(&paths[i], &sources[i].shp_path, &field(&sources[i]))))
         .collect();
 
     if !todo.is_empty() {
         crate::log!("Packing {} of {} sources into {:?} ...", todo.len(), sources.len(), cache_dir);
         let t0 = std::time::Instant::now();
-        let pb = ProgressBar::new(todo.len() as u64);
-        pb.set_style(ProgressStyle::with_template(
-            "[{elapsed_precise}] {bar:45.green/blue} {pos:>4}/{len} sources  eta {eta}").unwrap());
-        todo.par_iter().try_for_each(|&i| -> Result<()> {
-            let out = PartialOutput::new(&paths[i])?;
-            pack_vector_file(&sources[i].shp_path, &field(&sources[i]), out.path())?;
-            out.commit()?;
-            pb.inc(1);
-            Ok(())
-        })?;
-        pb.finish_and_clear();
+        let jobs: Vec<(PathBuf, String, PathBuf)> = todo.iter()
+            .map(|&i| (sources[i].shp_path.clone(), field(&sources[i]), paths[i].clone()))
+            .collect();
+        pack_files(&jobs)?;
         crate::log!("Packed {} sources in {:.1}s", todo.len(), t0.elapsed().as_secs_f64());
     } else if sources.iter().any(|s| !is_pack(&s.shp_path)) {
         crate::log!("Using the packs in {:?}", cache_dir);
@@ -181,14 +174,4 @@ fn cached_pack_name(source: &Path) -> String {
     let h = Sha256::digest(full.to_string_lossy().as_bytes());
     let stem = source.file_stem().unwrap_or_default().to_string_lossy();
     format!("{}-{:02x}{:02x}{:02x}{:02x}.cpk", stem, h[0], h[1], h[2], h[3])
-}
-
-/// Does `pack` hold `source` as it is now (same path, size, mtime, field)?
-fn pack_is_current(pack: &Path, source: &Path, field: &str) -> bool {
-    let (Ok(p), Ok(m)) = (Pack::open(pack), std::fs::metadata(source)) else { return false };
-    let Ok(meta) = p.meta() else { return false };
-    meta["source"].as_str() == Some(&*source.to_string_lossy())
-        && meta["source_size"].as_u64() == Some(m.len())
-        && meta["source_mtime_ns"].as_str() == Some(&*mtime_ns(&m).to_string())
-        && meta["elevation_field"].as_str() == Some(field)
 }

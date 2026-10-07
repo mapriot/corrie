@@ -37,6 +37,10 @@ enum Cmd {
     Tile(TileArgs),
     /// Merge contour PMTiles (e.g. one per country) into one clustered archive
     Merge(MergeArgs),
+    /// Pack contour sources (SHP, FlatGeobuf, …) into .cpk files that tile reads directly
+    Pack(PackArgs),
+    /// Write packs out as lines for QGIS (FlatGeobuf, GeoPackage, GeoJSON or SHP)
+    Unpack(UnpackArgs),
     /// Check that two contour PMTiles hold the same tiles and lines
     ///
     /// Tiles are matched by z/x/y, decoded, and their lines compared per
@@ -62,6 +66,43 @@ struct MergeArgs {
 }
 
 #[derive(clap::Args, Debug)]
+struct PackArgs {
+    /// Source files (SHP, FlatGeobuf, GeoPackage, anything GDAL reads); each
+    /// becomes <name>.cpk next to it
+    #[arg(required_unless_present = "config")]
+    inputs: Vec<std::path::PathBuf>,
+    /// Pack every source of this tilemaker config next to its file instead,
+    /// and write a copy of the config whose sources are the packs
+    #[arg(long, value_name = "CONFIG", conflicts_with = "inputs")]
+    config: Option<std::path::PathBuf>,
+    /// Where the config copy goes [default: <config>-packs.json next to it]
+    #[arg(long, value_name = "FILE", requires = "config")]
+    out_config: Option<std::path::PathBuf>,
+    /// Elevation field of the inputs (with --config: each layer's
+    /// source_columns, or elevation)
+    #[arg(long, default_value = "elevation")]
+    field: String,
+    /// Pack again even when an up-to-date pack exists
+    #[arg(long)]
+    force: bool,
+    /// Worker threads [default: all cores]
+    #[arg(short = 'j', long)]
+    workers: Option<usize>,
+}
+
+#[derive(clap::Args, Debug)]
+struct UnpackArgs {
+    /// Output file; the format follows the extension: .fgb, .gpkg, .geojson or .shp
+    output: std::path::PathBuf,
+    /// Packs to write (e.g. a country and its neighbours)
+    #[arg(required = true)]
+    inputs: Vec<std::path::PathBuf>,
+    /// Only lines touching this box: min_lon,min_lat,max_lon,max_lat
+    #[arg(long, value_name = "BOX", allow_hyphen_values = true)]
+    bbox: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
 struct CompareArgs {
     /// First archive (e.g. the live one)
     a: std::path::PathBuf,
@@ -70,6 +111,15 @@ struct CompareArgs {
     /// How many tile ids to list per kind of difference
     #[arg(long, default_value = "10")]
     show: usize,
+    /// Count lines as the same when every vertex inside the tile lies within
+    /// this many tile pixels of the other side's lines (for archives built
+    /// with different coordinate rounding). A tile has 4096 tile pixels and
+    /// is drawn 512 screen pixels wide: 8 tile pixels = 1 screen pixel
+    #[arg(long, value_name = "PX")]
+    tolerance: Option<f64>,
+    /// Also write every differing tile, with its kind and deviation, as JSON
+    #[arg(long, value_name = "FILE")]
+    json: Option<std::path::PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -289,6 +339,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::Tile(a) => run_tile(a),
         Cmd::Compare(a) => run_compare(a),
         Cmd::Merge(a) => run_merge(a),
+        Cmd::Pack(a) => run_pack(a),
+        Cmd::Unpack(a) => run_unpack(a),
     }
 }
 
@@ -341,94 +393,149 @@ fn run_merge(args: MergeArgs) -> anyhow::Result<()> {
 }
 
 fn run_compare(args: CompareArgs) -> anyhow::Result<()> {
-    use corrie::container::pmtiles::{gunzip, tile_id_to_zxy, PmtilesReader, TileEntry};
-    use std::collections::BTreeMap;
+    use corrie::compare::{compare, Kind, DEV_CAP};
+    use corrie::container::pmtiles::tile_id_to_zxy;
 
-    let ra = PmtilesReader::open(&args.a)?;
-    let rb = PmtilesReader::open(&args.b)?;
-    let ea = ra.entries()?;
-    let eb = rb.entries()?;
-
-    // Merge-join both entry lists (each sorted by tile_id).
-    let (mut only_a, mut only_b) = (Vec::new(), Vec::new());
-    let mut both: Vec<(TileEntry, TileEntry)> = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    while i < ea.len() || j < eb.len() {
-        match (ea.get(i), eb.get(j)) {
-            (Some(a), Some(b)) if a.tile_id == b.tile_id => { both.push((*a, *b)); i += 1; j += 1; }
-            (Some(a), Some(b)) if a.tile_id < b.tile_id => { only_a.push(a.tile_id); i += 1; }
-            (Some(_), Some(b)) => { only_b.push(b.tile_id); j += 1; }
-            (Some(a), None) => { only_a.push(a.tile_id); i += 1; }
-            (None, Some(b)) => { only_b.push(b.tile_id); j += 1; }
-            (None, None) => unreachable!(),
-        }
-    }
-
-    // Canonical tile content: lines grouped by attributes, each group sorted.
-    type Canon = BTreeMap<(i32, bool, bool), Vec<Vec<(i32, i32)>>>;
-    let canon = |raw: &[u8]| -> anyhow::Result<Canon> {
-        let mut m = Canon::new();
-        for f in corrie::mvt::decode_tile(&gunzip(raw)?, "elevation")? {
-            m.entry((f.elevation, f.main, f.show)).or_default().extend(f.lines);
-        }
-        for lines in m.values_mut() { lines.sort(); }
-        Ok(m)
-    };
-    let count_pts = |c: &Canon| -> usize { c.values().flatten().map(|l| l.len()).sum() };
-
-    // Multiset inclusion of lines, group by group: is every line of `small` also in `big`?
-    let contains = |big: &Canon, small: &Canon| -> bool {
-        small.iter().all(|(k, ls)| {
-            let Some(bl) = big.get(k) else { return false };
-            let mut bi = bl.iter().peekable();
-            ls.iter().all(|l| {
-                while bi.peek().is_some_and(|b| *b < l) { bi.next(); }
-                bi.next_if(|b| *b == l).is_some()
-            })
-        })
-    };
-    // How a differing tile differs: a has extra lines, b has extra lines, or lines changed.
-    #[derive(Clone, Copy, PartialEq)]
-    enum Diff { AExtra, BExtra, Changed }
-    let results: Vec<anyhow::Result<Option<(u64, usize, usize, Diff)>>> = both
-        .par_iter()
-        .map(|(a, b)| {
-            let (ba, bb) = (ra.tile_bytes(a), rb.tile_bytes(b));
-            if ba == bb { return Ok(None); }
-            let (ca, cb) = (canon(ba)?, canon(bb)?);
-            if ca == cb { return Ok(None); }
-            let kind = if contains(&ca, &cb) { Diff::AExtra } else if contains(&cb, &ca) { Diff::BExtra } else { Diff::Changed };
-            Ok(Some((a.tile_id, count_pts(&ca), count_pts(&cb), kind)))
-        })
-        .collect();
-    let mut differing = Vec::new();
-    for r in results { if let Some(d) = r? { differing.push(d); } }
-
+    let r = compare(&args.a, &args.b, args.tolerance)?;
     let zxy = |id: u64| { let (z, x, y) = tile_id_to_zxy(id); format!("{z}/{x}/{y}") };
-    out!("tiles: a={} b={} common={}", ea.len(), eb.len(), both.len());
-    out!("only in a: {}{}", only_a.len(),
-        only_a.iter().take(args.show).map(|&id| format!(" {}", zxy(id))).collect::<String>());
-    out!("only in b: {}{}", only_b.len(),
-        only_b.iter().take(args.show).map(|&id| format!(" {}", zxy(id))).collect::<String>());
-    out!("common tiles with different lines: {}", differing.len());
+    let list = |ids: &mut dyn Iterator<Item = u64>| ids.take(args.show).map(|id| format!(" {}", zxy(id))).collect::<String>();
+    out!("tiles: a={} b={} common={}", r.tiles_a, r.tiles_b, r.common);
+    out!("only in a: {}{}", r.only_a.len(), list(&mut r.only_a.iter().copied()));
+    out!("only in b: {}{}", r.only_b.len(), list(&mut r.only_b.iter().copied()));
+    let changed: Vec<_> = r.diffs.iter().filter(|d| d.kind != Kind::EdgeSliver).collect();
+    out!("common tiles with different lines: {}", changed.len());
+    let dev = |d: Option<f64>| match d {
+        Some(v) if v >= DEV_CAP => format!(" max {DEV_CAP}+ px"),
+        Some(v) => format!(" max {v:.2} px ({:.2} screen px)", v / 8.0),
+        None => " (a whole elevation group on one side only)".to_string(),
+    };
     for (kind, label) in [
-        (Diff::AExtra, "a has every line of b, plus more"),
-        (Diff::BExtra, "b has every line of a, plus more"),
-        (Diff::Changed, "lines changed (neither contains the other)"),
+        (Kind::WithinTolerance, "within the tolerance"),
+        (Kind::EdgeSliver, "only on one side, a sliver at the tile edge (within the tolerance)"),
+        (Kind::AExtra, "a has every line of b, plus more"),
+        (Kind::BExtra, "b has every line of a, plus more"),
+        (Kind::Changed, "lines changed (neither contains the other)"),
     ] {
-        let of_kind: Vec<_> = differing.iter().filter(|d| d.3 == kind).collect();
+        let of_kind: Vec<_> = r.diffs.iter().filter(|d| d.kind == kind).collect();
         if of_kind.is_empty() { continue; }
-        out!("  {label}: {}", of_kind.len());
-        for (id, pa, pb, _) in of_kind.iter().take(args.show) {
-            out!("    {}  points a={} b={}", zxy(*id), pa, pb);
+        let worst = of_kind.iter().filter_map(|d| d.max_dev).fold(0.0f64, f64::max);
+        let summary = if args.tolerance.is_some() && worst > 0.0 {
+            format!(" (largest deviation {worst:.2} tile px = {:.2} screen px)", worst / 8.0)
+        } else { String::new() };
+        out!("  {label}: {}{summary}", of_kind.len());
+        for d in of_kind.iter().take(args.show) {
+            let dv = if args.tolerance.is_some() { dev(d.max_dev) } else { String::new() };
+            out!("    {}  points a={} b={}{dv}", zxy(d.tile_id), d.points_a, d.points_b);
         }
     }
-    if only_a.is_empty() && only_b.is_empty() && differing.is_empty() {
-        out!("IDENTICAL (same tiles, same lines)");
+    if let Some(path) = &args.json {
+        let tile = |id: u64| { let (z, x, y) = tile_id_to_zxy(id); serde_json::json!({"z": z, "x": x, "y": y}) };
+        let doc = serde_json::json!({
+            "a": args.a, "b": args.b, "tolerance": args.tolerance,
+            "tiles_a": r.tiles_a, "tiles_b": r.tiles_b, "common": r.common,
+            "only_a": r.only_a.iter().map(|&id| tile(id)).collect::<Vec<_>>(),
+            "only_b": r.only_b.iter().map(|&id| tile(id)).collect::<Vec<_>>(),
+            "diffs": r.diffs.iter().map(|d| {
+                let (z, x, y) = tile_id_to_zxy(d.tile_id);
+                serde_json::json!({"z": z, "x": x, "y": y, "kind": d.kind, "points_a": d.points_a, "points_b": d.points_b, "max_dev": d.max_dev})
+            }).collect::<Vec<_>>(),
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&doc)?).with_context(|| format!("write {:?}", path))?;
+    }
+    if r.matches() {
+        if r.diffs.is_empty() {
+            out!("IDENTICAL (same tiles, same lines)");
+        } else {
+            out!("SAME within {} px (same tiles, lines within the tolerance)", args.tolerance.unwrap_or(0.0));
+        }
         Ok(())
     } else {
         anyhow::bail!("archives differ")
     }
+}
+
+fn run_pack(args: PackArgs) -> anyhow::Result<()> {
+    use corrie::pack::{is_current, pack_files};
+    use std::path::{Path, PathBuf};
+
+    if let Some(w) = args.workers {
+        rayon::ThreadPoolBuilder::new().num_threads(w).build_global().context("rayon")?;
+    }
+    // (source, elevation field, pack) for every source to pack
+    let mut all: Vec<(PathBuf, String, PathBuf)> = Vec::new();
+    match &args.config {
+        Some(cfg) => {
+            for s in corrie::config::parse_and_resolve(cfg)? {
+                if corrie::build::is_pack(&s.shp_path) { continue; }
+                let field = s.source_columns.first().cloned().unwrap_or_else(|| "elevation".to_string());
+                all.push((s.shp_path.clone(), field, s.shp_path.with_extension("cpk")));
+            }
+        }
+        None => {
+            for p in &args.inputs {
+                all.push((p.clone(), args.field.clone(), p.with_extension("cpk")));
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (src, _, out) in &all {
+        if !seen.insert(out.clone()) {
+            anyhow::bail!("two sources would write {:?} (e.g. {:?}); rename one", out, src);
+        }
+    }
+    let todo: Vec<_> = all.iter().filter(|(src, field, out)| args.force || !is_current(out, src, field)).cloned().collect();
+    let t0 = std::time::Instant::now();
+    if !todo.is_empty() {
+        corrie::log!("Packing {} sources ({} already up to date) ...", todo.len(), all.len() - todo.len());
+        pack_files(&todo)?;
+    }
+    let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let source_bytes: u64 = all.iter().map(|(src, _, _)| {
+        if src.extension().is_some_and(|e| e.eq_ignore_ascii_case("shp")) {
+            ["shp", "shx", "dbf"].iter().map(|e| size(&src.with_extension(e))).sum()
+        } else { size(src) }
+    }).sum();
+    let pack_bytes: u64 = all.iter().map(|(_, _, out)| size(out)).sum();
+    corrie::log!("{} packs: {:.2} GB of sources -> {:.2} GB of packs ({:.1}x smaller), {:.1}s",
+        all.len(), source_bytes as f64 / 1e9, pack_bytes as f64 / 1e9,
+        source_bytes as f64 / pack_bytes.max(1) as f64, t0.elapsed().as_secs_f64());
+
+    if let Some(cfg) = &args.config {
+        // The same config, every non-pack source pointing at its pack.
+        let mut doc: serde_json::Value = serde_json::from_slice(&std::fs::read(cfg)?)?;
+        if let Some(layers) = doc.get_mut("layers").and_then(|l| l.as_object_mut()) {
+            for layer in layers.values_mut() {
+                if let Some(src) = layer.get("source").and_then(|s| s.as_str()).map(str::to_string) {
+                    if !corrie::build::is_pack(Path::new(&src)) {
+                        layer["source"] = Path::new(&src).with_extension("cpk").to_string_lossy().into();
+                    }
+                }
+            }
+        }
+        let out = args.out_config.clone().unwrap_or_else(|| {
+            let stem = cfg.file_stem().unwrap_or_default().to_string_lossy();
+            cfg.with_file_name(format!("{stem}-packs.json"))
+        });
+        std::fs::write(&out, serde_json::to_vec_pretty(&doc)?).with_context(|| format!("write {:?}", out))?;
+        corrie::log!("Wrote {:?}", out);
+    }
+    Ok(())
+}
+
+fn run_unpack(args: UnpackArgs) -> anyhow::Result<()> {
+    let bbox = match &args.bbox {
+        None => None,
+        Some(s) => {
+            let v: Vec<f64> = s.split(',').map(|x| x.trim().parse()).collect::<Result<_, _>>()
+                .context("--bbox: expected min_lon,min_lat,max_lon,max_lat")?;
+            if v.len() != 4 { anyhow::bail!("--bbox: expected four numbers"); }
+            Some([v[0], v[1], v[2], v[3]])
+        }
+    };
+    let t0 = std::time::Instant::now();
+    let s = corrie::unpack::unpack(&args.inputs, &args.output, bbox)?;
+    corrie::log!("Wrote {} lines ({} vertices) to {:?} in {:.1}s", s.lines, s.vertices, args.output, t0.elapsed().as_secs_f64());
+    Ok(())
 }
 
 fn run_build(args: BuildArgs) -> anyhow::Result<()> {
