@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.3.0 — 2026-10-07
+
+### Added
+
+- `corrie pack`: turn contour sources (shapefiles or any vector file GDAL
+  reads) into packs, `.cpk` files of about 4.6 bytes per vertex, 3.6× smaller
+  than the SHP set. Vertices are stored on a 2^32 Web Mercator grid (they
+  move by less than 1 cm), each line in 128-segment pieces with a spatial
+  index, read in place. `--config` packs a tilemaker config's sources and
+  writes a copy of the config that reads the packs, changing only the
+  `source` strings; `--only GROUPS` does this for a few groups at a time.
+- `corrie unpack`: write packs as FlatGeobuf, GeoPackage, GeoJSON or
+  Shapefile, with `elevation`, `main`, `show`, `source` and `folder`, for
+  example to check neighbouring countries in QGIS. `--bbox` limits it to
+  the lines touching a box.
+- `corrie compare --tolerance PX`: count lines as the same when they lie
+  within `PX` tile pixels of each other (8 = one screen pixel), for builds by
+  different versions. `--json FILE` writes every differing tile.
+
+### Changed
+
+- `tile` reads packs as sources, and packs any other source before tiling
+  instead of ingesting it into a feature store. On a 506 M vertex test set:
+  2.8× faster from SHPs and 3.9× faster from packs than 0.2.0, peak RSS
+  12.4 → 2.7 GB. The temp cache is about 3.6× smaller; a config of packs
+  needs none. Tiling from a source or from its pack gives byte-identical
+  archives.
+- `--cache-dir` keeps one pack per source and reuses each while its source
+  is unchanged. Caches written by 0.2.0 are not read and can be deleted.
+- The `--shards` key covers a pack's own file only, so deleting the SHPs a
+  pack was made from does not rebuild the group.
+- Tiling version 2: the tiles change (see Fixed), so `--shards` group
+  archives built by 0.2.0 are tiled again once.
+- Subcommands listed as tile, pack, unpack, merge, compare, build.
+
+### Fixed
+
+- Douglas-Peucker simplification measured each point's distance to the
+  infinite line through the chord instead of to the chord itself. Where a
+  contour runs out and back, the tip could be cut off depending on
+  sub-centimetre differences in the input; on real data the drawn line
+  strayed up to 30 tile pixels (about 4 screen pixels) from the source
+  line, against at most the tolerance now. About 2% of tiles change by more
+  than one screen pixel.
+
 ## 0.2.0 — 2026-10-07
 
 ### Added
