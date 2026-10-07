@@ -17,7 +17,8 @@
 //! Each group archive records a key in its metadata (`corrie_shard.key`): a
 //! hash of `TILING_VERSION`, the zoom range, bounding box and output layer
 //! name, and per source its layer settings plus the size and modification
-//! time of its .shp and .dbf. An archive whose key matches is reused as is.
+//! time of its file (for an SHP, also of its .dbf; a pack holds everything
+//! it needs). An archive whose key matches is reused as is.
 
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
@@ -95,13 +96,13 @@ pub fn group_key(group: &Group, settings: &Settings, layer_name: &str, base_dir:
     let mut sources = Vec::new();
     for s in &group.sources {
         let rel = s.shp_path.strip_prefix(base_dir).unwrap_or(&s.shp_path);
-        let dbf = dbf_of(&s.shp_path);
+        let dbf = Some(&s.shp_path).filter(|p| !crate::build::is_pack(p)).map(|p| dbf_of(p));
         sources.push(serde_json::json!({
             "name": s.source_layer_name,
             "layer": s.output_layer_name,
             "shp": rel.to_string_lossy(),
             "shp_file": file(&s.shp_path)?,
-            "dbf_file": if dbf.exists() { file(&dbf)? } else { serde_json::Value::Null },
+            "dbf_file": match dbf.filter(|d| d.exists()) { Some(d) => file(&d)?, None => serde_json::Value::Null },
             "minzoom": s.minzoom,
             "maxzoom": s.maxzoom,
             "source_columns": s.source_columns,
@@ -303,5 +304,27 @@ mod tests {
         let k4 = group_key(&group, &settings, "contour", dir.path()).unwrap();
         std::fs::write(shp.with_extension("Dbf"), b"dbf, edited").unwrap();
         assert_ne!(k4, group_key(&group, &settings, "contour", dir.path()).unwrap(), ".Dbf size");
+    }
+
+    /// A pack's key depends on the pack alone, so deleting the SHP set it was
+    /// made from (whose .dbf has the same stem) does not rebuild its group.
+    #[test]
+    fn pack_key_ignores_files_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cpk = dir.path().join("cz/a.cpk");
+        std::fs::create_dir_all(cpk.parent().unwrap()).unwrap();
+        std::fs::write(&cpk, b"pack").unwrap();
+        std::fs::write(cpk.with_extension("dbf"), b"dbf").unwrap();
+        let group = Group { name: "cz".into(), sources: vec![src("a", cpk.to_str().unwrap())] };
+        let settings = Settings {
+            minzoom: 11, maxzoom: 14, basezoom: None, include_ids: false,
+            bounding_box: [-180.0, -85.0, 180.0, 85.0], compress: "gzip".into(),
+            name: String::new(), version: String::new(), description: String::new(),
+        };
+        let k = group_key(&group, &settings, "contour", dir.path()).unwrap();
+        std::fs::remove_file(cpk.with_extension("dbf")).unwrap();
+        assert_eq!(k, group_key(&group, &settings, "contour", dir.path()).unwrap());
+        std::fs::write(&cpk, b"pack, rebuilt").unwrap();
+        assert_ne!(k, group_key(&group, &settings, "contour", dir.path()).unwrap());
     }
 }
