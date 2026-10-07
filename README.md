@@ -290,8 +290,8 @@ corrie tile config.json out.pmtiles
 ## `corrie pack` — compact contour sources
 
 ```sh
-corrie pack <SOURCE>... [--field elevation] [--force] [-j N]
-corrie pack --config <CONFIG.json> [--only GROUPS] [--out-config FILE] [--force] [-j N]
+corrie pack <SOURCE>... [--field elevation] [--drop-seams DEG] [--force] [-j N]
+corrie pack --config <CONFIG.json> [--only GROUPS] [--out-config FILE] [--drop-seams DEG] [--force] [-j N]
 ```
 
 A pack (`.cpk`) holds one source's lines and their elevations, and nothing
@@ -308,10 +308,15 @@ source the pack was made from.
   not kept.
 - **Lines** are stored in pieces of 128 segments with a spatial index over
   the pieces, so a tile reads only the parts of a line that reach it.
+- **`--drop-seams DEG`** leaves out every feature whose vertices, over all
+  its parts, all lie within `DEG` degrees of a whole-degree meridian or
+  parallel. Contouring a mosaic of 1° DEM tiles (JAXA AW3D30, for example)
+  traces such lines where one tile's data meets nodata. A feature with one
+  vertex elsewhere is kept whole. The run reports how many were left out.
 
 Each source becomes `<name>.cpk` next to it. A pack that is up to date (made
-from the same path, size, modification time and elevation column) is kept
-unless `--force` is given; packs are written as `.partial` and renamed when
+from the same path, size, modification time, elevation column and
+`--drop-seams`) is kept unless `--force` is given; packs are written as `.partial` and renamed when
 complete. The run ends with the sizes:
 
 ```
