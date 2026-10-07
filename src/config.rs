@@ -1,4 +1,5 @@
-//! Tilemaker config.json parser (subset for SHP-only contour pipelines).
+//! Tilemaker config.json parser (the subset contour pipelines use: vector
+//! file or pack sources, no OSM input).
 //!
 //! Unknown OSM-only fields (Lua hooks, way_function, node_keys, …) are
 //! silently ignored via serde's default behaviour.
@@ -69,7 +70,8 @@ pub struct SourceLayer {
     pub source_layer_name: String,
     /// The output layer this feeds (after resolving `write_to`).
     pub output_layer_name: String,
-    /// Absolute path to the SHP file.
+    /// Absolute path of the source: a pack (.cpk), an SHP or another vector
+    /// file GDAL reads.
     pub shp_path: PathBuf,
     pub minzoom: u8,
     pub maxzoom: u8,

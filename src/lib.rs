@@ -1,4 +1,5 @@
-//! corrie — DEM-to-contour vector tile generator and tilemaker SHP→PMTiles replacement.
+//! corrie — contour vector tiles: contour lines (packs, SHPs, any GDAL vector
+//! file) listed in a tilemaker config, or a DEM, to clustered PMTiles.
 
 /// `eprintln!` that never panics. A run can hold hours of work; a closed
 /// terminal or tmux pane (EIO) or a reader that went away (EPIPE, e.g. a

@@ -14,7 +14,7 @@
 //! Layout (little-endian, every section 8-byte aligned):
 //!
 //! ```text
-//! Header (136 B) | data (varints) | lines: [LineRec] | chunks: [ChunkRec] | nodes: [[u32; 4]] | meta (JSON)
+//! Header (120 B) | data (varints) | lines: [LineRec] | chunks: [ChunkRec] | nodes: [[u32; 4]] | meta (JSON)
 //! ```
 
 use std::fs::File;

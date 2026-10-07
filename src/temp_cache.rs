@@ -1,7 +1,8 @@
 //! Ephemeral cache directory management.
 //!
-//! When `corrie tile` runs without `--cache-dir`, the feature store lives
-//! in a temp directory tagged with the corrie process's PID. `TempDir`'s
+//! When `corrie tile` runs without `--cache-dir`, the packs it makes from
+//! sources that are not packs yet live in a temp directory tagged with the
+//! corrie process's PID. `TempDir`'s
 //! `Drop` impl removes the directory on clean scope exit; `cleanup` removes
 //! it on Ctrl+C / SIGTERM / SIGHUP. SIGKILL and OOM kills still leave it
 //! behind.

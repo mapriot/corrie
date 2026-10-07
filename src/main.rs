@@ -25,7 +25,7 @@ struct Level {
 }
 
 #[derive(clap::Parser, Debug)]
-#[command(name = "corrie", version, about = "Contour vector tiles: shapefiles or a DEM to clustered PMTiles")]
+#[command(name = "corrie", version, about = "Contour vector tiles: contour lines or a DEM to clustered PMTiles")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -33,20 +33,21 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum Cmd {
-    /// Tile contour shapefiles listed in a tilemaker config.json into clustered PMTiles
+    /// Tile the contour sources (packs or SHPs) of a tilemaker config.json into clustered PMTiles
     Tile(TileArgs),
-    /// Merge contour PMTiles (e.g. one per country) into one clustered archive
-    Merge(MergeArgs),
     /// Pack contour sources (SHP, FlatGeobuf, …) into .cpk files that tile reads directly
     Pack(PackArgs),
     /// Write packs out as lines for QGIS (FlatGeobuf, GeoPackage, GeoJSON or SHP)
     Unpack(UnpackArgs),
+    /// Merge contour PMTiles (e.g. one per country) into one clustered archive
+    Merge(MergeArgs),
     /// Check that two contour PMTiles hold the same tiles and lines
     ///
     /// Tiles are matched by z/x/y, decoded, and their lines compared per
     /// (elevation, main, show) group; line order inside a tile is ignored.
     /// A tile that differs is reported as "a has every line of b, plus more",
-    /// the reverse, or "lines changed". Exits 0 when both are identical.
+    /// the reverse, or "lines changed". Exits 0 when both are identical, or
+    /// with --tolerance when every difference is within it.
     Compare(CompareArgs),
     /// Contour a single DEM raster straight into PMTiles or MBTiles (no shapefiles)
     Build(BuildArgs),
@@ -118,9 +119,9 @@ struct CompareArgs {
     #[arg(long, default_value = "10")]
     show: usize,
     /// Count lines as the same when every vertex inside the tile lies within
-    /// this many tile pixels of the other side's lines (for archives built
-    /// with different coordinate rounding). A tile has 4096 tile pixels and
-    /// is drawn 512 screen pixels wide: 8 tile pixels = 1 screen pixel
+    /// this many tile pixels of the other side's lines (e.g. builds by
+    /// different corrie versions). A tile is 4096 tile pixels and is drawn
+    /// 512 screen pixels wide: 8 tile pixels = 1 screen pixel
     #[arg(long, value_name = "PX")]
     tolerance: Option<f64>,
     /// Also write every differing tile, with its kind and deviation, as JSON
@@ -173,18 +174,18 @@ struct TileArgs {
     config: std::path::PathBuf,
     /// Output .pmtiles, replaced once the new file is complete
     output: std::path::PathBuf,
-    /// Keep the feature store cache in this directory and reuse it while the
-    /// SHPs are unchanged. Without it, a temp cache is used and removed when
-    /// the run ends or is stopped.
+    /// Keep the packs made from sources that are not packs (SHPs, …) in this
+    /// directory and reuse each while its source is unchanged. Without it,
+    /// they go to a temp dir removed when the run ends or is stopped.
     #[arg(long, value_name = "DIR")]
     cache_dir: Option<std::path::PathBuf>,
-    /// Re-ingest even if the --cache-dir cache is valid
+    /// Pack the sources again even if their packs in --cache-dir are current
     #[arg(long)]
     rebuild_cache: bool,
     /// Tile each group of sources (each folder below the common source
     /// folder, e.g. one per country) into DIR/<group>.pmtiles, reusing archives
     /// whose inputs are unchanged, then merge them all into OUTPUT. The temp
-    /// cache holds one group at a time.
+    /// cache holds one group's packs at a time.
     #[arg(long, value_name = "DIR", conflicts_with_all = ["cache_dir", "rebuild_cache"])]
     shards: Option<std::path::PathBuf>,
     /// Worker threads [default: all cores]

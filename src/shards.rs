@@ -2,14 +2,14 @@
 //! own archive, reuse archives whose inputs are unchanged, merge them all.
 //!
 //! This keeps the temp cache at the size of the largest group instead of the
-//! whole input, and makes rebuilds incremental: only groups whose SHPs,
+//! whole input, and makes rebuilds incremental: only groups whose sources,
 //! layer settings or tiling code changed are tiled again. Because tiling is
 //! per feature, the merged archive holds the same tiles as one run over all
 //! sources (see `merge`).
 //!
-//! Groups: the sources' SHPs are grouped by the first directory below the
+//! Groups: the source files are grouped by the first directory below the
 //! deepest directory that contains all of them, so `contours/cz/data/a.shp`
-//! and `contours/at/b.shp` form groups `cz` and `at`. SHPs lying directly in
+//! and `contours/at/b.cpk` form groups `cz` and `at`. Files lying directly in
 //! that common directory form one group each, named after the file. Names
 //! that differ only in case are rejected: on a case-insensitive file system
 //! they would share one archive.
@@ -179,7 +179,7 @@ pub fn build(
             paths.push(path);
             continue;
         }
-        crate::log!("{label}  building from {} SHPs", g.sources.len());
+        crate::log!("{label}  building from {} sources", g.sources.len());
         let t0 = Instant::now();
         // tile_sources writes <group>.pmtiles.partial and renames it when
         // complete, so an archive at the final path is always whole.
