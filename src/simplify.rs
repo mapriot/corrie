@@ -1,5 +1,11 @@
 /// Douglas-Peucker line simplification. `epsilon` is the maximum allowed
-/// perpendicular distance from the simplified line to any omitted point.
+/// distance from the simplified line to any omitted point.
+///
+/// Distances are measured to the chord as a segment, not to the infinite
+/// line through its ends. With the line, a spike that runs out and back
+/// (both ends of the chord nearly at the same point) gets an arbitrary
+/// direction and distance, so its tip was kept or dropped by sub-centimetre
+/// differences in the input.
 ///
 /// Iterative stack-based implementation. Output is APPENDED to `out` (caller
 /// owns capacity; clear if you want a fresh result). `work_stack` and `kept`
@@ -55,8 +61,11 @@ pub fn simplify_into(
         } else {
             let inv_len_sq = 1.0 / len_sq;
             for i in (lo + 1)..hi {
-                let cross = (points[i].0 - a.0) * dy - (points[i].1 - a.1) * dx;
-                let d_sq = cross * cross * inv_len_sq;
+                let (ex, ey) = (points[i].0 - a.0, points[i].1 - a.1);
+                // position along the chord, clamped to its ends
+                let t = ((ex * dx + ey * dy) * inv_len_sq).clamp(0.0, 1.0);
+                let (fx, fy) = (ex - t * dx, ey - t * dy);
+                let d_sq = fx * fx + fy * fy;
                 if d_sq > max_dist_sq {
                     max_dist_sq = d_sq;
                     max_idx = i;
@@ -122,7 +131,18 @@ mod tests {
             let ey = p.1 - a.1;
             return (ex * ex + ey * ey).sqrt();
         }
-        ((p.0 - a.0) * dy - (p.1 - a.1) * dx).abs() / len_sq.sqrt()
+        let t = (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len_sq).clamp(0.0, 1.0);
+        ((p.0 - a.0 - t * dx).powi(2) + (p.1 - a.1 - t * dy).powi(2)).sqrt()
+    }
+
+    /// A spike running out past the end of the chord and back keeps its tip:
+    /// its distance to the chord segment is large even though it lies on the
+    /// chord's line.
+    #[test]
+    fn keeps_a_spike_along_the_chord() {
+        let pts = [(0.0, 0.0), (10.0, 0.0), (30.0, 0.05), (10.2, 0.1), (20.0, 0.0)];
+        let out = simplify(&pts, 1.0);
+        assert!(out.contains(&(30.0, 0.05)), "{out:?}");
     }
 
     #[test]
