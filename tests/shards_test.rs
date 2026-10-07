@@ -71,7 +71,7 @@ fn shards_and_cache_dir_are_exclusive() {
                "--cache-dir", dir.path().join("c").to_str().unwrap()])
         .output().unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("drop --cache-dir"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot be used with"));
 }
 
 /// A group whose data lies just outside the config's bounding_box, but in a

@@ -25,7 +25,7 @@ struct Level {
 }
 
 #[derive(clap::Parser, Debug)]
-#[command(name = "corrie", version, about = "DEM → vector contour tile generator")]
+#[command(name = "corrie", version, about = "Contour vector tiles: shapefiles or a DEM to clustered PMTiles")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -33,33 +33,41 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum Cmd {
-    /// (legacy) DEM-direct path: single raster → PMTiles/MBTiles
-    Build(BuildArgs),
-    /// Read tilemaker config.json + SHPs, write clustered PMTiles.
+    /// Tile contour shapefiles listed in a tilemaker config.json into clustered PMTiles
     Tile(TileArgs),
-    /// Compare two contour PMTiles tile by tile: same tile set, same lines
-    /// per (elevation, main, show) group. Line order inside a tile is ignored.
-    Compare(CompareArgs),
-    /// Merge contour PMTiles (e.g. one per country) into one clustered archive.
+    /// Merge contour PMTiles (e.g. one per country) into one clustered archive
     Merge(MergeArgs),
+    /// Check that two contour PMTiles hold the same tiles and lines
+    ///
+    /// Tiles are matched by z/x/y, decoded, and their lines compared per
+    /// (elevation, main, show) group; line order inside a tile is ignored.
+    /// A tile that differs is reported as "a has every line of b, plus more",
+    /// the reverse, or "lines changed". Exits 0 when both are identical.
+    Compare(CompareArgs),
+    /// Contour a single DEM raster straight into PMTiles or MBTiles (no shapefiles)
+    Build(BuildArgs),
 }
 
 #[derive(clap::Args, Debug)]
 struct MergeArgs {
-    /// Output .pmtiles
+    /// Output .pmtiles, replaced once the new file is complete
     output: std::path::PathBuf,
-    /// Input .pmtiles archives
+    /// Input .pmtiles archives, as written by `corrie tile`. They must all
+    /// use the same layer name; the output may be one of them.
     #[arg(required = true)]
     inputs: Vec<std::path::PathBuf>,
+    /// Worker threads [default: all cores]
     #[arg(short = 'j', long)]
     workers: Option<usize>,
 }
 
 #[derive(clap::Args, Debug)]
 struct CompareArgs {
+    /// First archive (e.g. the live one)
     a: std::path::PathBuf,
+    /// Second archive (e.g. a new build)
     b: std::path::PathBuf,
-    /// How many differing tiles to print.
+    /// How many tile ids to list per kind of difference
     #[arg(long, default_value = "10")]
     show: usize,
 }
@@ -70,24 +78,35 @@ struct BuildArgs {
     input: std::path::PathBuf,
     /// Output file — .pmtiles or .mbtiles
     output: std::path::PathBuf,
+    /// Lowest zoom to write
     #[arg(long, default_value = "11")]
     min_z: u8,
+    /// Highest zoom to write
     #[arg(long, default_value = "14")]
     max_z: u8,
+    /// Contour intervals as ZOOM:INTERVAL pairs; each interval (in metres)
+    /// is drawn from its zoom upwards
     #[arg(long, default_value = "11:50,12:20,13:10,14:5")]
     levels: String,
+    /// Tag elevations divisible by N as main=1 (0 = never)
     #[arg(long, default_value = "50")]
     main_every: i32,
+    /// Tag elevations divisible by N as show=1 (0 = never)
     #[arg(long, default_value = "100")]
     show_every: i32,
+    /// MVT layer name
     #[arg(long, default_value = "contour")]
     layer: String,
+    /// MVT attribute name for the elevation
     #[arg(long, default_value = "elevation")]
     elevation_attr: String,
+    /// Nodata value [default: the raster's own]
     #[arg(long, allow_hyphen_values = true)]
     nodata: Option<f32>,
+    /// Douglas-Peucker tolerance in tile pixels (0 = off)
     #[arg(long, default_value = "2.0")]
     simplify: f64,
+    /// Worker threads [default: all cores]
     #[arg(short = 'j', long)]
     workers: Option<usize>,
 }
@@ -96,22 +115,23 @@ struct BuildArgs {
 struct TileArgs {
     /// Path to a tilemaker config.json
     config: std::path::PathBuf,
-    /// Output .pmtiles
+    /// Output .pmtiles, replaced once the new file is complete
     output: std::path::PathBuf,
-    /// Persistent cache directory. If omitted, ingest writes to a temp dir
-    /// that's deleted on exit (no cache reuse). Pass this if you want
-    /// subsequent runs with the same SHPs to skip the ingest pass.
-    #[arg(long)]
+    /// Keep the feature store cache in this directory and reuse it while the
+    /// SHPs are unchanged. Without it, a temp cache is used and removed when
+    /// the run ends or is stopped.
+    #[arg(long, value_name = "DIR")]
     cache_dir: Option<std::path::PathBuf>,
-    /// Force re-ingest even if cache appears valid (only meaningful with
-    /// `--cache-dir`; ignored otherwise).
+    /// Re-ingest even if the --cache-dir cache is valid
     #[arg(long)]
     rebuild_cache: bool,
-    /// Build one archive per group of sources (e.g. per country folder) in
-    /// this directory, reusing archives whose inputs are unchanged, then
-    /// merge them into OUTPUT. The temp cache only ever holds one group.
-    #[arg(long, value_name = "DIR")]
+    /// Tile each group of sources (each folder below the common source
+    /// folder, e.g. one per country) into DIR/<group>.pmtiles, reusing archives
+    /// whose inputs are unchanged, then merge them all into OUTPUT. The temp
+    /// cache holds one group at a time.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["cache_dir", "rebuild_cache"])]
     shards: Option<std::path::PathBuf>,
+    /// Worker threads [default: all cores]
     #[arg(short = 'j', long)]
     workers: Option<usize>,
 }
@@ -283,16 +303,13 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
     corrie::cleanup::check_output(&args.output)?;
     let cfg = parse(&args.config)?;
     let sources = parse_and_resolve(&args.config)?;
-    // All sources go into one MVT layer: the output layer of the first
-    // source in config order (mapriot: "contour").
+    // All sources go into one MVT layer: the output layer of the
+    // alphabetically first layer key (mapriot: "contour").
     let layer = sources.first().context("no layers in config")?.output_layer_name.clone();
     let t0 = std::time::Instant::now();
 
     match &args.shards {
         Some(shard_dir) => {
-            if args.cache_dir.is_some() {
-                anyhow::bail!("--shards builds each group with its own temp cache; drop --cache-dir");
-            }
             let base_dir = args.config.parent().unwrap_or(std::path::Path::new("."));
             let s = corrie::shards::build(&sources, &cfg.settings, &layer, base_dir, shard_dir, &args.output)?;
             corrie::log!("Done in {:.1}s: {} groups ({} built, {} reused), {} tiles",
