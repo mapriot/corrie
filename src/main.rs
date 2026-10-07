@@ -75,9 +75,15 @@ struct PackArgs {
     /// and write a copy of the config whose sources are the packs
     #[arg(long, value_name = "CONFIG", conflicts_with = "inputs")]
     config: Option<std::path::PathBuf>,
-    /// Where the config copy goes [default: <config>-packs.json next to it]
+    /// Where the config copy goes [default: <config>-packs.json next to it];
+    /// may be the config itself
     #[arg(long, value_name = "FILE", requires = "config")]
     out_config: Option<std::path::PathBuf>,
+    /// With --config: only these groups, comma-separated, named as --shards
+    /// names them (the country folder: cz for contours/cz/data/x.shp). The
+    /// config copy switches only their sources to packs.
+    #[arg(long, value_name = "GROUPS", value_delimiter = ',', requires = "config")]
+    only: Vec<String>,
     /// Elevation field of the inputs (with --config: each layer's
     /// source_columns, or elevation)
     #[arg(long, default_value = "elevation")]
@@ -461,14 +467,29 @@ fn run_pack(args: PackArgs) -> anyhow::Result<()> {
     if let Some(w) = args.workers {
         rayon::ThreadPoolBuilder::new().num_threads(w).build_global().context("rayon")?;
     }
-    // (source, elevation field, pack) for every source to pack
+    // (source, elevation field, pack) for every source to pack, and with
+    // --config the layers whose source turns into its pack
     let mut all: Vec<(PathBuf, String, PathBuf)> = Vec::new();
+    let mut switched: Vec<String> = Vec::new();
     match &args.config {
         Some(cfg) => {
-            for s in corrie::config::parse_and_resolve(cfg)? {
+            let sources = corrie::config::parse_and_resolve(cfg)?;
+            let chosen = if args.only.is_empty() { sources } else {
+                // the groups --shards builds, so the names match its archives
+                let groups = corrie::shards::group_sources(&sources)?;
+                for name in &args.only {
+                    if !groups.iter().any(|g| &g.name == name) {
+                        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+                        anyhow::bail!("--only: no group {:?} in {:?} (groups: {})", name, cfg, names.join(", "));
+                    }
+                }
+                groups.into_iter().filter(|g| args.only.contains(&g.name)).flat_map(|g| g.sources).collect()
+            };
+            for s in chosen {
                 if corrie::build::is_pack(&s.shp_path) { continue; }
                 let field = s.source_columns.first().cloned().unwrap_or_else(|| "elevation".to_string());
                 all.push((s.shp_path.clone(), field, s.shp_path.with_extension("cpk")));
+                switched.push(s.source_layer_name);
             }
         }
         None => {
@@ -501,25 +522,43 @@ fn run_pack(args: PackArgs) -> anyhow::Result<()> {
         source_bytes as f64 / pack_bytes.max(1) as f64, t0.elapsed().as_secs_f64());
 
     if let Some(cfg) = &args.config {
-        // The same config, every non-pack source pointing at its pack.
-        let mut doc: serde_json::Value = serde_json::from_slice(&std::fs::read(cfg)?)?;
-        if let Some(layers) = doc.get_mut("layers").and_then(|l| l.as_object_mut()) {
-            for layer in layers.values_mut() {
-                if let Some(src) = layer.get("source").and_then(|s| s.as_str()).map(str::to_string) {
-                    if !corrie::build::is_pack(Path::new(&src)) {
-                        layer["source"] = Path::new(&src).with_extension("cpk").to_string_lossy().into();
-                    }
-                }
-            }
-        }
         let out = args.out_config.clone().unwrap_or_else(|| {
             let stem = cfg.file_stem().unwrap_or_default().to_string_lossy();
             cfg.with_file_name(format!("{stem}-packs.json"))
         });
-        std::fs::write(&out, serde_json::to_vec_pretty(&doc)?).with_context(|| format!("write {:?}", out))?;
-        corrie::log!("Wrote {:?}", out);
+        let text = std::fs::read_to_string(cfg).with_context(|| format!("read {:?}", cfg))?;
+        let text = switch_sources(&text, &switched).with_context(|| format!("rewrite {:?}", cfg))?;
+        let o = corrie::cleanup::PartialOutput::new(&out)?;
+        std::fs::write(o.path(), text).with_context(|| format!("write {:?}", o.path()))?;
+        o.commit()?;
+        corrie::log!("Wrote {:?}: {} sources now read their packs", out, switched.len());
     }
     Ok(())
+}
+
+/// The config text with the source of each layer in `layers` ending in .cpk
+/// instead of its extension. Only those strings change, so the copy keeps
+/// the original's layout and a diff shows just the switched sources.
+fn switch_sources(text: &str, layers: &[String]) -> anyhow::Result<String> {
+    use std::path::Path;
+    let doc: serde_json::Value = serde_json::from_str(text)?;
+    let mut expected = doc.clone();
+    let mut out = text.to_string();
+    for name in layers {
+        let src = doc["layers"][name]["source"].as_str()
+            .with_context(|| format!("layer {name:?} has no source"))?;
+        let packed = Path::new(src).with_extension("cpk").to_string_lossy().into_owned();
+        let (from, to) = (serde_json::to_string(src)?, serde_json::to_string(&packed)?);
+        match out.matches(&from).count() {
+            1 => out = out.replacen(&from, &to, 1),
+            n => anyhow::bail!("source {src:?} of layer {name:?} appears {n} times in the text; switch it by hand"),
+        }
+        expected["layers"][name]["source"] = packed.into();
+    }
+    // the text edit changed exactly those sources
+    let got: serde_json::Value = serde_json::from_str(&out)?;
+    anyhow::ensure!(got == expected, "the edited config does not parse back as expected");
+    Ok(out)
 }
 
 fn run_unpack(args: UnpackArgs) -> anyhow::Result<()> {

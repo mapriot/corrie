@@ -101,3 +101,60 @@ fn group_just_outside_the_bounding_box_matches_a_single_run() {
     let b = corrie::container::pmtiles::PmtilesReader::open(&d.join("groups/b.pmtiles")).unwrap();
     assert!(!b.entries().unwrap().is_empty());
 }
+
+/// The migration from SHPs to packs, one group at a time: pack one group,
+/// build from the mixed config, delete that group's SHPs, then switch the
+/// rest. The tiles never change, and only switched groups are tiled again.
+#[test]
+fn moving_groups_to_packs_keeps_the_tiles() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::create_dir_all(d.join("a")).unwrap();
+    std::fs::create_dir_all(d.join("b")).unwrap();
+    common::write_shapefile_at(&d.join("a"), "tiny.shp", 14.0);
+    common::write_shapefile_at(&d.join("b"), "tiny.shp", 14.4);
+    write_config(d);
+    let p = |n: &str| d.join(n).to_str().unwrap().to_string();
+    let log = |o: &Output| String::from_utf8_lossy(&o.stderr).into_owned();
+    let same = |x: &str, y: &str| {
+        let cmp = corrie(&["compare", &p(x), &p(y)]);
+        assert!(cmp.status.success(), "{}", String::from_utf8_lossy(&cmp.stdout));
+    };
+    corrie(&["tile", &p("config.json"), &p("shp.pmtiles"), "--shards", &p("groups")]);
+
+    // pack group b only: the copy differs from the config in b's source alone
+    let packed = corrie(&["pack", "--config", &p("config.json"), "--only", "b"]);
+    assert!(log(&packed).contains("1 sources now read their packs"), "{}", log(&packed));
+    assert!(d.join("b/tiny.cpk").exists() && !d.join("a/tiny.cpk").exists());
+    let (orig, copy) = (std::fs::read_to_string(p("config.json")).unwrap(), std::fs::read_to_string(p("config-packs.json")).unwrap());
+    let changed: Vec<(&str, &str)> = orig.lines().zip(copy.lines()).filter(|(x, y)| x != y).collect();
+    assert_eq!(orig.lines().count(), copy.lines().count());
+    assert_eq!(changed.len(), 1, "{changed:?}");
+    assert_eq!(changed[0].0.replace("b/tiny.shp", "b/tiny.cpk"), changed[0].1);
+
+    let mixed = corrie(&["tile", &p("config-packs.json"), &p("mixed.pmtiles"), "--shards", &p("groups")]);
+    assert!(log(&mixed).contains("1 built, 1 reused"), "{}", log(&mixed));
+    same("shp.pmtiles", "mixed.pmtiles");
+
+    // b's SHP set is no longer needed, and its archive is reused without it
+    for ext in ["shp", "shx", "dbf", "prj"] {
+        let _ = std::fs::remove_file(d.join("b/tiny").with_extension(ext));
+    }
+    let gone = corrie(&["tile", &p("config-packs.json"), &p("gone.pmtiles"), "--shards", &p("groups")]);
+    assert!(log(&gone).contains("0 built, 2 reused"), "{}", log(&gone));
+    same("shp.pmtiles", "gone.pmtiles");
+
+    // an unknown group is an error, naming the groups there are
+    let bad = Command::new(env!("CARGO_BIN_EXE_corrie"))
+        .args(["pack", "--config", &p("config-packs.json"), "--only", "nope"]).output().unwrap();
+    assert!(!bad.status.success() && log(&bad).contains("no group \"nope\"") && log(&bad).contains("groups: a, b"), "{}", log(&bad));
+
+    // the rest, written over the packs config itself
+    let rest = corrie(&["pack", "--config", &p("config-packs.json"), "--out-config", &p("config-packs.json")]);
+    assert!(log(&rest).contains("1 sources now read their packs"), "{}", log(&rest));
+    let all = std::fs::read_to_string(p("config-packs.json")).unwrap();
+    assert!(all.contains("a/tiny.cpk") && all.contains("b/tiny.cpk") && !all.contains(".shp"), "{all}");
+    let packs = corrie(&["tile", &p("config-packs.json"), &p("packs.pmtiles"), "--shards", &p("groups")]);
+    assert!(log(&packs).contains("1 built, 1 reused"), "{}", log(&packs));
+    same("shp.pmtiles", "packs.pmtiles");
+}
