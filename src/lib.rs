@@ -7,6 +7,7 @@ pub mod container;
 pub mod contour;
 pub mod feature_store;
 pub mod mercator;
+pub mod merge;
 pub mod mvt;
 pub mod raster;
 pub mod shapefile_read;

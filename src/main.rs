@@ -32,6 +32,21 @@ enum Cmd {
     /// Compare two contour PMTiles tile by tile: same tile set, same lines
     /// per (elevation, main, show) group. Line order inside a tile is ignored.
     Compare(CompareArgs),
+    /// Merge contour PMTiles (e.g. one per country) into one clustered archive.
+    Merge(MergeArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct MergeArgs {
+    /// Output .pmtiles
+    output: std::path::PathBuf,
+    /// Input .pmtiles archives
+    #[arg(required = true)]
+    inputs: Vec<std::path::PathBuf>,
+    #[arg(long, default_value = "contour")]
+    layer: String,
+    #[arg(short = 'j', long)]
+    workers: Option<usize>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -242,6 +257,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Build(a) => run_build(a),
         Cmd::Tile(a) => run_tile(a),
         Cmd::Compare(a) => run_compare(a),
+        Cmd::Merge(a) => run_merge(a),
     }
 }
 
@@ -395,6 +411,17 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
     pb.finish();
     eprintln!("Wrote {} non-empty tiles", written);
     writer.finalize()?;
+    Ok(())
+}
+
+fn run_merge(args: MergeArgs) -> anyhow::Result<()> {
+    if let Some(w) = args.workers {
+        rayon::ThreadPoolBuilder::new().num_threads(w).build_global().context("rayon")?;
+    }
+    let t0 = std::time::Instant::now();
+    let stats = corrie::merge::merge_archives(&args.inputs, &args.output, &args.layer, "elevation")?;
+    eprintln!("Merged {} archives: {} tiles, {} present in several inputs, in {:.1}s",
+        args.inputs.len(), stats.tiles, stats.merged, t0.elapsed().as_secs_f64());
     Ok(())
 }
 
