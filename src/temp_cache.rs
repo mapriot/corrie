@@ -91,12 +91,12 @@ pub fn reap_orphan_caches() -> usize {
     for path in &targets {
         match std::fs::remove_dir_all(path) {
             Ok(()) => reaped += 1,
-            Err(e) => eprintln!("warn: failed to reap {}: {e}", path.display()),
+            Err(e) => crate::log!("warn: failed to reap {}: {e}", path.display()),
         }
     }
     if reaped > 0 {
         let s = if reaped == 1 { "" } else { "s" };
-        eprintln!("Reaped {reaped} orphan cache dir{s} from prior killed runs");
+        crate::log!("Reaped {reaped} orphan cache dir{s} from prior killed runs");
     }
     reaped
 }
@@ -111,7 +111,7 @@ pub fn create_ephemeral_cache() -> anyhow::Result<tempfile::TempDir> {
         .prefix(&prefix)
         .tempdir()
         .context("create temp cache dir")?;
-    eprintln!("Temp cache: {}", td.path().display());
+    crate::log!("Temp cache: {}", td.path().display());
     Ok(td)
 }
 

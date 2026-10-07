@@ -64,12 +64,12 @@ where
         let elev_f64 = match feature.field_as_double(elev_idx) {
             Ok(Some(v)) => v,
             Ok(None) => {
-                eprintln!("warning: record {} of {:?} has null elevation", rec_idx, shp_path);
+                crate::log!("warning: record {} of {:?} has null elevation", rec_idx, shp_path);
                 rec_idx += 1;
                 continue;
             }
             Err(e) => {
-                eprintln!("warning: record {} of {:?} elevation read error: {}", rec_idx, shp_path, e);
+                crate::log!("warning: record {} of {:?} elevation read error: {}", rec_idx, shp_path, e);
                 rec_idx += 1;
                 continue;
             }

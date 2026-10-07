@@ -164,7 +164,7 @@ pub fn build(
     std::fs::create_dir_all(shard_dir).with_context(|| format!("create {:?}", shard_dir))?;
     let groups = group_sources(sources)?;
     let width = groups.iter().map(|g| g.name.len()).max().unwrap_or(0);
-    eprintln!("{} groups in {:?}", groups.len(), shard_dir);
+    crate::log!("{} groups in {:?}", groups.len(), shard_dir);
 
     let (mut built, mut reused) = (0, 0);
     let mut paths = Vec::with_capacity(groups.len());
@@ -173,19 +173,19 @@ pub fn build(
         let path = shard_dir.join(format!("{}.pmtiles", g.name));
         let key = group_key(g, settings, layer_name, base_dir)?;
         if stored_key(&path).as_deref() == Some(key.as_str()) {
-            eprintln!("{label}  reused");
+            crate::log!("{label}  reused");
             reused += 1;
             paths.push(path);
             continue;
         }
-        eprintln!("{label}  building from {} SHPs", g.sources.len());
+        crate::log!("{label}  building from {} SHPs", g.sources.len());
         let t0 = Instant::now();
         // tile_sources writes <group>.pmtiles.partial and renames it when
         // complete, so an archive at the final path is always whole.
         let meta = serde_json::json!({ "group": g.name, "key": key, "tiling_version": TILING_VERSION });
         let s = tile_sources(&g.sources, settings, layer_name, &path, Cache::Ephemeral, &[(META_FIELD, meta)])
             .with_context(|| format!("group {}", g.name))?;
-        eprintln!("{label}  built: {} features, {} tiles in {:.1}s",
+        crate::log!("{label}  built: {} features, {} tiles in {:.1}s",
             s.features, s.tiles, t0.elapsed().as_secs_f64());
         built += 1;
         paths.push(path);
@@ -195,17 +195,17 @@ pub fn build(
     for entry in std::fs::read_dir(shard_dir)?.flatten() {
         let p = entry.path();
         if p.extension().is_some_and(|e| e == "pmtiles") && !known.contains(&p) {
-            eprintln!("note: {:?} is not a group of this config; not merged", p);
+            crate::log!("note: {:?} is not a group of this config; not merged", p);
         }
         if p.extension().is_some_and(|e| e == "partial") {
-            eprintln!("note: {:?} is left from a stopped run; delete it if no corrie is running", p);
+            crate::log!("note: {:?} is left from a stopped run; delete it if no corrie is running", p);
         }
     }
 
-    eprintln!("Merging {} group archives into {:?} ...", paths.len(), output);
+    crate::log!("Merging {} group archives into {:?} ...", paths.len(), output);
     let t0 = Instant::now();
     let m = Merge::open(&paths)?.write(output, "elevation")?;
-    eprintln!("Merged: {} tiles, {} joined from several groups, in {:.1}s",
+    crate::log!("Merged: {} tiles, {} joined from several groups, in {:.1}s",
         m.tiles, m.merged, t0.elapsed().as_secs_f64());
     Ok(ShardStats { groups: groups.len(), built, reused, tiles: m.tiles, merged: m.merged })
 }

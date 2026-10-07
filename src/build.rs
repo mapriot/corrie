@@ -61,17 +61,17 @@ pub fn tile_sources(
     let mut stats = TileStats { features: 0, vertices: 0, tiles: 0 };
     if !persistent || rebuild || !cache_valid(&cache_dir, &shp_paths) {
         if persistent {
-            eprintln!("Ingesting {} SHPs into {:?} ...", shp_paths.len(), cache_dir);
+            crate::log!("Ingesting {} SHPs into {:?} ...", shp_paths.len(), cache_dir);
         } else {
-            eprintln!("Ingesting {} SHPs (temp cache, removed at the end) ...", shp_paths.len());
+            crate::log!("Ingesting {} SHPs (temp cache, removed at the end) ...", shp_paths.len());
         }
         let t0 = std::time::Instant::now();
         let s = crate::ingest::run(sources, &cache_dir)?;
-        eprintln!("Ingested {} features ({} vertices) in {:.2}s",
+        crate::log!("Ingested {} features ({} vertices) in {:.2}s",
             s.features, s.vertices, t0.elapsed().as_secs_f64());
         (stats.features, stats.vertices) = (s.features, s.vertices);
     } else {
-        eprintln!("Using cached feature store in {:?}", cache_dir);
+        crate::log!("Using cached feature store in {:?}", cache_dir);
     }
 
     let reader = Reader::open(&cache_dir)?;
@@ -81,9 +81,9 @@ pub fn tile_sources(
     // the config's bounding box (mapriot's is the whole world).
     let mut tiles = enumerate_tiles_pruned(&rtree, settings.bounding_box, settings.minzoom, settings.maxzoom);
     if tiles.is_empty() {
-        eprintln!("No data within the config's bounding_box; nothing to do.");
+        crate::log!("No data within the config's bounding_box; nothing to do.");
     }
-    eprintln!("{} tiles to process (quadtree-pruned)", tiles.len());
+    crate::log!("{} tiles to process (quadtree-pruned)", tiles.len());
     hilbert_sort(&mut tiles);
 
     let [w, s, e, n] = settings.bounding_box;
@@ -133,9 +133,9 @@ pub fn tile_sources(
         }
     }
     pb.finish();
-    eprintln!("Wrote {} non-empty tiles", stats.tiles);
     writer.finalize()?;
     out.commit()?;
+    crate::log!("Wrote {} non-empty tiles", stats.tiles);
     if let Some(td) = _temp_cache {
         let path = td.path().to_path_buf();
         drop(td);

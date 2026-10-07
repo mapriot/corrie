@@ -1,5 +1,16 @@
 //! corrie — DEM-to-contour vector tile generator and tilemaker SHP→PMTiles replacement.
 
+/// `eprintln!` that never panics. A run can hold hours of work; a closed
+/// terminal or tmux pane (EIO) or a reader that went away (EPIPE, e.g. a
+/// killed `tee`) must not stop it, so write errors on stderr are ignored.
+#[macro_export]
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 pub mod attribute_rules;
 pub mod build;
 pub mod cleanup;

@@ -5,6 +5,14 @@ use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use rayon::prelude::*;
 
 use corrie::container::Writer;
+
+/// `println!` that ignores a closed stdout (e.g. `corrie compare … | head`).
+macro_rules! out {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
 use corrie::raster::{dataset_wgs84_bounds, read_elevation_grid};
 use corrie::tile::{lat_to_tile_y_xyz, lon_to_tile_x};
 use corrie::{contour, mvt, simplify};
@@ -287,7 +295,7 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
             }
             let base_dir = args.config.parent().unwrap_or(std::path::Path::new("."));
             let s = corrie::shards::build(&sources, &cfg.settings, &layer, base_dir, shard_dir, &args.output)?;
-            eprintln!("Done in {:.1}s: {} groups ({} built, {} reused), {} tiles",
+            corrie::log!("Done in {:.1}s: {} groups ({} built, {} reused), {} tiles",
                 t0.elapsed().as_secs_f64(), s.groups, s.built, s.reused, s.tiles);
         }
         None => {
@@ -296,7 +304,7 @@ fn run_tile(args: TileArgs) -> anyhow::Result<()> {
                 None => Cache::Ephemeral,
             };
             tile_sources(&sources, &cfg.settings, &layer, &args.output, cache, &[])?;
-            eprintln!("Done in {:.1}s", t0.elapsed().as_secs_f64());
+            corrie::log!("Done in {:.1}s", t0.elapsed().as_secs_f64());
         }
     }
     Ok(())
@@ -310,7 +318,7 @@ fn run_merge(args: MergeArgs) -> anyhow::Result<()> {
     corrie::cleanup::check_output(&args.output)?;
     let merge = corrie::merge::Merge::open(&args.inputs)?;
     let stats = merge.write(&args.output, "elevation")?;
-    eprintln!("Merged {} archives: {} tiles, {} present in several inputs, in {:.1}s",
+    corrie::log!("Merged {} archives: {} tiles, {} present in several inputs, in {:.1}s",
         args.inputs.len(), stats.tiles, stats.merged, t0.elapsed().as_secs_f64());
     Ok(())
 }
@@ -380,12 +388,12 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<()> {
     for r in results { if let Some(d) = r? { differing.push(d); } }
 
     let zxy = |id: u64| { let (z, x, y) = tile_id_to_zxy(id); format!("{z}/{x}/{y}") };
-    println!("tiles: a={} b={} common={}", ea.len(), eb.len(), both.len());
-    println!("only in a: {}{}", only_a.len(),
+    out!("tiles: a={} b={} common={}", ea.len(), eb.len(), both.len());
+    out!("only in a: {}{}", only_a.len(),
         only_a.iter().take(args.show).map(|&id| format!(" {}", zxy(id))).collect::<String>());
-    println!("only in b: {}{}", only_b.len(),
+    out!("only in b: {}{}", only_b.len(),
         only_b.iter().take(args.show).map(|&id| format!(" {}", zxy(id))).collect::<String>());
-    println!("common tiles with different lines: {}", differing.len());
+    out!("common tiles with different lines: {}", differing.len());
     for (kind, label) in [
         (Diff::AExtra, "a has every line of b, plus more"),
         (Diff::BExtra, "b has every line of a, plus more"),
@@ -393,13 +401,13 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<()> {
     ] {
         let of_kind: Vec<_> = differing.iter().filter(|d| d.3 == kind).collect();
         if of_kind.is_empty() { continue; }
-        println!("  {label}: {}", of_kind.len());
+        out!("  {label}: {}", of_kind.len());
         for (id, pa, pb, _) in of_kind.iter().take(args.show) {
-            println!("    {}  points a={} b={}", zxy(*id), pa, pb);
+            out!("    {}  points a={} b={}", zxy(*id), pa, pb);
         }
     }
     if only_a.is_empty() && only_b.is_empty() && differing.is_empty() {
-        println!("IDENTICAL (same tiles, same lines)");
+        out!("IDENTICAL (same tiles, same lines)");
         Ok(())
     } else {
         anyhow::bail!("archives differ")
@@ -437,7 +445,7 @@ fn run_build(args: BuildArgs) -> anyhow::Result<()> {
             }
         }
     }
-    eprintln!(
+    corrie::log!(
         "Zoom {}-{}:  {} candidate tiles  ({} threads)",
         args.min_z,
         args.max_z,
@@ -449,7 +457,7 @@ fn run_build(args: BuildArgs) -> anyhow::Result<()> {
     let needs_hilbert_sort =
         args.output.extension().and_then(|e| e.to_str()) == Some("pmtiles");
     if needs_hilbert_sort {
-        eprintln!("Sorting {} tiles by Hilbert ID...", tiles.len());
+        corrie::log!("Sorting {} tiles by Hilbert ID...", tiles.len());
         use corrie::container::pmtiles::tile_id;
         tiles.sort_by_cached_key(|&(z, x, y)| {
             tile_id(z, x, y)
@@ -524,7 +532,7 @@ fn run_build(args: BuildArgs) -> anyhow::Result<()> {
                 Ok(None) => {}
                 Err(e) => {
                     let (z, x, y) = chunk[i];
-                    eprintln!("Warning: tile {}/{}/{} failed: {:#}", z, x, y, e);
+                    corrie::log!("Warning: tile {}/{}/{} failed: {:#}", z, x, y, e);
                     n_errors += 1;
                 }
             }
@@ -532,15 +540,15 @@ fn run_build(args: BuildArgs) -> anyhow::Result<()> {
     }
 
     pb.finish_with_message("done");
-    eprintln!("{} non-empty tiles written", n_written);
+    corrie::log!("{} non-empty tiles written", n_written);
     if n_errors > 0 {
-        eprintln!("Warning: {} tiles failed and were skipped", n_errors);
+        corrie::log!("Warning: {} tiles failed and were skipped", n_errors);
     }
 
     writer.finalize().context("finalize")?;
 
     let sz = std::fs::metadata(&args.output)?.len();
-    eprintln!(
+    corrie::log!(
         "Written {:?}  ({:.1} MB)",
         args.output,
         sz as f64 / 1_048_576.0

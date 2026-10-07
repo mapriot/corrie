@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 /// Start `corrie tile` on a fixture that takes a moment to tile, with its
 /// temp dir inside `dir`, writing over an existing `out.pmtiles`.
 fn start(dir: &Path, ignore_sighup: bool) -> Child {
+    start_with(dir, ignore_sighup, false)
+}
+
+fn start_with(dir: &Path, ignore_sighup: bool, stderr_pipe: bool) -> Child {
     common::write_large_shapefile(dir, "big.shp", 400, 4000);
     let cfg = common::write_tiny_config(dir, "big.shp");
     std::fs::create_dir_all(dir.join("tmp")).unwrap();
@@ -22,6 +26,9 @@ fn start(dir: &Path, ignore_sighup: bool) -> Child {
     if ignore_sighup {
         // As nohup does: SIGHUP ignored before exec.
         unsafe { cmd.pre_exec(|| { libc::signal(libc::SIGHUP, libc::SIG_IGN); Ok(()) }); }
+    }
+    if stderr_pipe {
+        cmd.stderr(std::process::Stdio::piped());
     }
     cmd.spawn().expect("spawn corrie")
 }
@@ -71,5 +78,25 @@ fn sighup_ignored_at_start_stays_ignored() {
     let status = child.wait().unwrap();
     assert!(status.success(), "{status}");
     assert_eq!(&std::fs::read(d.join("out.pmtiles")).unwrap()[..7], b"PMTiles");
+    assert!(temp_entries(d).is_empty(), "temp cache left: {:?}", temp_entries(d));
+}
+
+/// The terminal or the pipe behind stderr can be gone when the signal comes
+/// (a closed tmux pane, a `| tee` killed by the same Ctrl+C). Writing the
+/// stop messages then fails; the run must still stop and clean up.
+#[test]
+fn sigterm_after_stderr_is_gone_still_stops_and_cleans_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut child = start_with(d, false, true);
+    let stderr = child.stderr.take().unwrap();
+    wait_for_tiling(&mut child, d);
+    drop(stderr); // nobody reads stderr any more: writes now fail with EPIPE
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(130), "{status}");
+    assert!(!d.join("out.pmtiles.partial").exists(), "partial output left behind");
+    assert_eq!(std::fs::read(d.join("out.pmtiles")).unwrap(), b"previous build");
     assert!(temp_entries(d).is_empty(), "temp cache left: {:?}", temp_entries(d));
 }

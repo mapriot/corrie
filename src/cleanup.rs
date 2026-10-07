@@ -50,14 +50,21 @@ pub fn forget_on_signal(path: &Path) {
 // on Unix an unlinked file stays usable until the process exits. The lock is
 // held until exit, so the main thread cannot register, finish an output and
 // exit 0 while its files are being removed.
+//
+// Nothing here may panic: the handler runs once, on ctrlc's thread, and a
+// panic would end that thread and leave every later signal unhandled. So
+// the files go first, the messages (which may fail: the terminal may be
+// gone) after, and the process always exits.
 fn on_signal() {
     let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-    eprintln!();
-    for p in reg.paths.iter().rev() {
-        match remove_path(p) {
-            Ok(true) => eprintln!("Stopped: removed {}", p.display()),
+    let results: Vec<(&PathBuf, std::io::Result<bool>)> =
+        reg.paths.iter().rev().map(|p| (p, remove_path(p))).collect();
+    crate::log!();
+    for (p, r) in results {
+        match r {
+            Ok(true) => crate::log!("Stopped: removed {}", p.display()),
             Ok(false) => {}
-            Err(e) => eprintln!("Stopped: could not remove {}: {e}", p.display()),
+            Err(e) => crate::log!("Stopped: could not remove {}: {e}", p.display()),
         }
     }
     std::process::exit(130);
@@ -213,25 +220,6 @@ mod tests {
         assert!(remove_path(&d).unwrap());
         assert!(!f.exists() && !d.exists());
         assert!(!remove_path(&f).unwrap());
-    }
-
-    /// The handler must not take over a signal the process was told to
-    /// ignore (nohup), and must still handle the others.
-    #[cfg(unix)]
-    #[test]
-    fn installing_keeps_ignored_signals_ignored() {
-        let disposition = |sig| {
-            let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
-            unsafe { libc::sigaction(sig, std::ptr::null(), &mut old) };
-            old.sa_sigaction
-        };
-        unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
-        let p = PathBuf::from("/nonexistent/installing-keeps-ignored");
-        remove_on_signal(&p).unwrap();
-        forget_on_signal(&p);
-        assert_eq!(disposition(libc::SIGHUP), libc::SIG_IGN, "SIGHUP was ignored and must stay so");
-        assert_ne!(disposition(libc::SIGTERM), libc::SIG_IGN);
-        assert_ne!(disposition(libc::SIGTERM), libc::SIG_DFL, "SIGTERM must be handled");
     }
 
     #[test]

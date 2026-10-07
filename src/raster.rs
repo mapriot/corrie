@@ -36,7 +36,7 @@ pub fn dataset_wgs84_bounds(path: &Path) -> Result<(f64, f64, f64, f64)> {
     let south = ys.iter().cloned().fold(f64::MAX, f64::min);
     let north = ys.iter().cloned().fold(f64::MIN, f64::max);
 
-    eprintln!(
+    crate::log!(
         "Input: {}x{} px  WGS84 bounds [{:.4}W {:.4}S {:.4}E {:.4}N]",
         w, h, west, south, east, north
     );
