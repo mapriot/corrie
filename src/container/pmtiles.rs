@@ -345,8 +345,9 @@ pub struct PmtilesWriter {
     bounds_e7: (i32, i32, i32, i32),
     center_e7: (i32, i32),
     center_zoom: u8,
-    /// Metadata JSON, computed at create time from layer/elevation names.
-    metadata_json: String,
+    /// Metadata JSON object: vector_layers from create, plus any fields
+    /// added with `set_metadata`. Serialized at finalize.
+    metadata: serde_json::Map<String, serde_json::Value>,
     /// Strict-monotonic check.
     last_tile_id: Option<u64>,
     /// Running count of tiles written. Used by finalize for header fields.
@@ -373,9 +374,13 @@ impl PmtilesWriter {
 
         // TileJSON 3.0 vector_layers — required by MapLibre for layer introspection.
         // Matches the metadata schema corrie wrote pre-rewrite.
-        let metadata_json = format!(
-            r#"{{"vector_layers":[{{"id":"{layer_name}","fields":{{"{elevation_attr}":"Number","main":"Number","show":"Number"}},"minzoom":{min_z},"maxzoom":{max_z}}}]}}"#
-        );
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("vector_layers".into(), serde_json::json!([{
+            "id": layer_name,
+            "fields": { elevation_attr: "Number", "main": "Number", "show": "Number" },
+            "minzoom": min_z,
+            "maxzoom": max_z,
+        }]));
 
         let leaves_reserved = tile_count_estimate.saturating_mul(LEAF_BYTES_PER_ENTRY).max(1024);
 
@@ -418,11 +423,16 @@ impl PmtilesWriter {
                 (center_lat * 1e7).round() as i32,
             ),
             center_zoom,
-            metadata_json,
+            metadata,
             last_tile_id: None,
             total_addressed: 0,
             cursor_elsewhere: true,
         })
+    }
+
+    /// Add a top-level field to the archive's JSON metadata.
+    pub fn set_metadata(&mut self, key: &str, value: serde_json::Value) {
+        self.metadata.insert(key.to_string(), value);
     }
 
     pub fn add_tile(&mut self, z: u8, x: u32, y: u32, mvt_raw: &[u8]) -> anyhow::Result<()> {
@@ -525,7 +535,8 @@ impl PmtilesWriter {
         }
 
         // 3. Gzip metadata.
-        let meta_gz = gzip(self.metadata_json.as_bytes()).context("gzip metadata")?;
+        let meta_json = serde_json::to_string(&self.metadata).context("serialize metadata")?;
+        let meta_gz = gzip(meta_json.as_bytes()).context("gzip metadata")?;
         if meta_gz.len() as u64 > METADATA_RESERVED {
             anyhow::bail!(
                 "metadata {} bytes exceeds reservation {} — increase METADATA_RESERVED",

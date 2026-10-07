@@ -63,6 +63,49 @@ fn on_signal() {
     std::process::exit(130);
 }
 
+/// An output written as `<name>.partial` next to its final path and renamed
+/// into place by [`PartialOutput::commit`]. Until then a file already at the
+/// final path stays untouched and readable (it may even be one of the run's
+/// inputs). A stop removes the partial file; so does dropping it without a
+/// commit, e.g. when the run fails.
+pub struct PartialOutput {
+    target: PathBuf,
+    partial: PathBuf,
+    committed: bool,
+}
+
+impl PartialOutput {
+    pub fn new(target: &Path) -> anyhow::Result<Self> {
+        let name = target.file_name().context("output path has no file name")?;
+        let mut partial_name = name.to_os_string();
+        partial_name.push(".partial");
+        let partial = target.with_file_name(partial_name);
+        remove_on_signal(&partial)?;
+        Ok(Self { target: target.to_path_buf(), partial, committed: false })
+    }
+
+    /// Where to write the output.
+    pub fn path(&self) -> &Path { &self.partial }
+
+    /// Move the finished file to its final path.
+    pub fn commit(mut self) -> anyhow::Result<()> {
+        std::fs::rename(&self.partial, &self.target)
+            .with_context(|| format!("rename {:?} to {:?}", self.partial, self.target))?;
+        self.committed = true;
+        forget_on_signal(&self.partial);
+        Ok(())
+    }
+}
+
+impl Drop for PartialOutput {
+    fn drop(&mut self) {
+        if !self.committed {
+            forget_on_signal(&self.partial);
+            let _ = std::fs::remove_file(&self.partial);
+        }
+    }
+}
+
 #[cfg(unix)]
 const HANDLED: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
@@ -138,6 +181,27 @@ mod tests {
         assert_eq!(disposition(libc::SIGHUP), libc::SIG_IGN, "SIGHUP was ignored and must stay so");
         assert_ne!(disposition(libc::SIGTERM), libc::SIG_IGN);
         assert_ne!(disposition(libc::SIGTERM), libc::SIG_DFL, "SIGTERM must be handled");
+    }
+
+    #[test]
+    fn partial_output_replaces_the_target_only_on_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.pmtiles");
+        std::fs::write(&target, b"old").unwrap();
+
+        let out = PartialOutput::new(&target).unwrap();
+        assert_eq!(out.path(), dir.path().join("out.pmtiles.partial"));
+        std::fs::write(out.path(), b"new").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        out.commit().unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert!(!dir.path().join("out.pmtiles.partial").exists());
+
+        let failed = PartialOutput::new(&target).unwrap();
+        std::fs::write(failed.path(), b"half").unwrap();
+        drop(failed);
+        assert!(!dir.path().join("out.pmtiles.partial").exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
     }
 
     #[test]

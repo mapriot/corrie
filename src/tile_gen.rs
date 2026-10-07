@@ -71,38 +71,43 @@ pub fn enumerate_tiles(bbox: [f64; 4], zmin: u8, zmax: u8) -> Vec<TileCoord> {
     out
 }
 
-/// Same set of tiles as `enumerate_tiles` would produce, minus every (z,x,y)
-/// whose extent contains no feature in `rtree`. Walks the tile space as a
-/// quadtree: probe each tile with `contains_any`; if empty, prune its entire
-/// subtree (4^(zmax-z) tiles skipped for free).
+/// Every tile at zooms `zmin..=zmax` that holds data in `rtree` and lies in
+/// a zmin tile intersecting `limit` (the config's `bounding_box`,
+/// `[min_lon, min_lat, max_lon, max_lat]` in WGS84). Walks the tile space as
+/// a quadtree from zmin: a tile without data prunes its whole subtree.
 ///
-/// `bbox = [min_lon, min_lat, max_lon, max_lat]` in WGS84 degrees. zmin/zmax
-/// inclusive on both ends.
+/// The zmin seeds include tiles that only touch the data's bounding box: a
+/// line ending exactly on a tile edge still clips into the tile beyond, and
+/// a run over some of the sources (one group of `--shards`) must visit the
+/// same tiles as a run over all of them. Seeds never leave the zmin tiles
+/// that intersect `limit`, whichever sources a run holds.
 pub fn enumerate_tiles_pruned(
     rtree: &rstar::RTree<crate::spatial_index::FeatureBbox>,
-    bbox: [f64; 4],
+    limit: [f64; 4],
     zmin: u8,
     zmax: u8,
 ) -> Vec<TileCoord> {
-    // Seed with every zmin tile that intersects bbox, edges included: when
-    // the data's west or north edge lies exactly on a tile edge, the tile on
-    // the other side touches it and can get a stub of a line (a run of
-    // only some groups' data must visit the same tiles as a run of all).
+    let Some((d_min_lon, d_min_latp, d_max_lon, d_max_latp)) = crate::spatial_index::rtree_bbox(rtree) else {
+        return Vec::new();
+    };
+    let n = 1i64 << zmin;
+    let latp_max = tiley2latp(0, zmin);
+    let fx = |lon: f64| (lon + 180.0) / 360.0 * n as f64;
+    let fy = |latp: f64| (latp_max - latp) / (2.0 * latp_max) * n as f64;
+    let clamp = |v: f64| (v as i64).clamp(0, n - 1);
+    // zmin tiles whose area intersects the config box (a tile that only
+    // touches its edge is outside)
+    let (lx0, lx1) = (clamp(fx(limit[0]).floor()), clamp(fx(limit[2]).ceil() - 1.0));
+    let (ly0, ly1) = (clamp(fy(lat2latp(limit[3])).floor()), clamp(fy(lat2latp(limit[1])).ceil() - 1.0));
+    // zmin tiles that intersect or touch the data
+    let (dx0, dx1) = (clamp(fx(d_min_lon).ceil() - 1.0), clamp(fx(d_max_lon).floor()));
+    let (dy0, dy1) = (clamp(fy(d_max_latp).ceil() - 1.0), clamp(fy(d_min_latp).floor()));
+    let (x0, x1, y0, y1) = (lx0.max(dx0), lx1.min(dx1), ly0.max(dy0), ly1.min(dy1));
+
     let mut stack: Vec<TileCoord> = Vec::new();
-    {
-        let n = 1i64 << zmin;
-        let latp_max = tiley2latp(0, zmin);
-        let fx = |lon: f64| (lon + 180.0) / 360.0 * n as f64;
-        let fy = |latp: f64| (latp_max - latp) / (2.0 * latp_max) * n as f64;
-        let clamp = |v: f64| (v as i64).clamp(0, n - 1) as u32;
-        let x0 = clamp(fx(bbox[0]).ceil() - 1.0);
-        let x1 = clamp(fx(bbox[2]).floor());
-        let y0 = clamp(fy(lat2latp(bbox[3])).ceil() - 1.0); // north edge
-        let y1 = clamp(fy(lat2latp(bbox[1])).floor());
-        for x in x0..=x1 {
-            for y in y0..=y1 {
-                stack.push(TileCoord { z: zmin, x, y });
-            }
+    for x in x0..=x1 {
+        for y in y0..=y1 {
+            stack.push(TileCoord { z: zmin, x: x as u32, y: y as u32 });
         }
     }
     let mut out: Vec<TileCoord> = Vec::new();
@@ -442,16 +447,30 @@ mod tests {
             push_chunk_bboxes(0, &[a, b], &mut v);
             build_rtree(v)
         };
+        let world = [-180.0, -85.0, 180.0, 85.0];
         // Starts exactly on the west edge and runs east.
         let rt = line([edge_lon, mid_latp], [mid_lon, mid_latp]);
-        let bbox = [edge_lon, crate::mercator::latp2lat(mid_latp), mid_lon, crate::mercator::latp2lat(mid_latp)];
-        let tiles = enumerate_tiles_pruned(&rt, bbox, 11, 11);
+        let tiles = enumerate_tiles_pruned(&rt, world, 11, 11);
         assert!(tiles.contains(&TileCoord { z: 11, x: t.x - 1, y: t.y }), "{tiles:?}");
         // Starts exactly on the north edge and runs south.
         let rt = line([mid_lon, edge_latp], [mid_lon, mid_latp]);
-        let lat = crate::mercator::latp2lat;
-        let bbox = [mid_lon, lat(mid_latp), mid_lon, lat(edge_latp)];
-        let tiles = enumerate_tiles_pruned(&rt, bbox, 11, 11);
+        let tiles = enumerate_tiles_pruned(&rt, world, 11, 11);
         assert!(tiles.contains(&TileCoord { z: 11, x: t.x, y: t.y - 1 }), "{tiles:?}");
+    }
+
+    /// Tiles outside the zmin tiles that intersect the config box are never
+    /// produced, even when the data continues past the box's edge and that
+    /// edge lies exactly on a tile edge.
+    #[test]
+    fn pruned_enumeration_stays_inside_the_config_box() {
+        let edge_lon = tilex2lon(1100, 11);
+        let latp = (tiley2latp(690, 11) + tiley2latp(691, 11)) / 2.0;
+        let mut v = Vec::new();
+        push_chunk_bboxes(0, &[[edge_lon - 0.5, latp], [edge_lon + 0.5, latp]], &mut v);
+        let rt = build_rtree(v);
+        let limit = [edge_lon, -85.0, 180.0, 85.0];
+        let tiles = enumerate_tiles_pruned(&rt, limit, 11, 13);
+        assert!(!tiles.is_empty());
+        assert!(tiles.iter().all(|t| tilex2lon(t.x, t.z) >= edge_lon), "a tile west of the box: {tiles:?}");
     }
 }

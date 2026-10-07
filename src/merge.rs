@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 
+use crate::cleanup::PartialOutput;
 use crate::container::pmtiles::{
     gunzip, gzip_tile, PmtilesReader, PmtilesWriter, TileEntry, COMPRESSION_GZIP, TILE_TYPE_MVT,
 };
@@ -29,14 +30,11 @@ pub struct MergeStats {
     pub merged: u64,
 }
 
-/// Merge `inputs` into a new clustered archive at `output`.
-pub fn merge_archives(inputs: &[PathBuf], output: &Path, layer_name: &str, elevation_attr: &str) -> Result<MergeStats> {
-    Merge::open(inputs)?.write(output, layer_name, elevation_attr, |_| Ok(()))
-}
-
 /// Opened inputs with their tiles grouped by tile_id, ready to write.
 pub struct Merge {
     readers: Vec<PmtilesReader>,
+    /// The MVT layer every input uses (from its `vector_layers` metadata).
+    layer_name: String,
     /// (tile_id, input index, entry), sorted by tile_id then input.
     all: Vec<(u64, u32, TileEntry)>,
     /// Ranges of `all` that share a tile_id.
@@ -44,16 +42,32 @@ pub struct Merge {
 }
 
 impl Merge {
-    /// Open every input and read its directories.
+    /// Open every input and read its directories. All inputs must use the
+    /// same layer name, and no file may be listed twice.
     pub fn open(inputs: &[PathBuf]) -> Result<Self> {
         if inputs.is_empty() { bail!("no inputs"); }
+        let mut seen = std::collections::HashSet::new();
+        for p in inputs {
+            let canon = p.canonicalize().with_context(|| format!("open {:?}", p))?;
+            if !seen.insert(canon) { bail!("{:?} is listed twice", p); }
+        }
         let readers: Vec<PmtilesReader> = inputs.iter().map(|p| PmtilesReader::open(p)).collect::<Result<_>>()?;
+        let mut layer_name: Option<String> = None;
         for (r, p) in readers.iter().zip(inputs) {
             let h = r.header();
             if h.tile_type != TILE_TYPE_MVT || h.tile_compression != COMPRESSION_GZIP {
                 bail!("{:?}: expected gzipped MVT tiles", p);
             }
+            let name = layer_of(r).with_context(|| format!("{:?}: no vector_layers in its metadata", p))?;
+            match &layer_name {
+                None => layer_name = Some(name),
+                Some(first) if *first != name => {
+                    bail!("{:?} has layer {:?}, {:?} has {:?}: inputs must use one layer name", inputs[0], first, p, name)
+                }
+                Some(_) => {}
+            }
         }
+        let layer_name = layer_name.unwrap();
 
         let mut all: Vec<(u64, u32, TileEntry)> = Vec::new();
         for (i, r) in readers.iter().enumerate() {
@@ -69,18 +83,13 @@ impl Merge {
                 s = k;
             }
         }
-        Ok(Self { readers, all, groups })
+        Ok(Self { readers, layer_name, all, groups })
     }
 
-    /// Write the merged archive. `created` is called right after `output`
-    /// has been created (or truncated), before any tile is written.
-    pub fn write(
-        &self,
-        output: &Path,
-        layer_name: &str,
-        elevation_attr: &str,
-        created: impl FnOnce(&Path) -> Result<()>,
-    ) -> Result<MergeStats> {
+    /// Write the merged archive. It is written as `<output>.partial` and
+    /// renamed when complete, so `output` may be one of the inputs.
+    pub fn write(&self, output: &Path, elevation_attr: &str) -> Result<MergeStats> {
+        let layer_name = self.layer_name.as_str();
         let hs: Vec<_> = self.readers.iter().map(|r| r.header().clone()).collect();
         let min_z = hs.iter().map(|h| h.min_zoom).min().unwrap();
         let max_z = hs.iter().map(|h| h.max_zoom).max().unwrap();
@@ -91,10 +100,10 @@ impl Merge {
             e7(hs.iter().map(|h| h.max_lon_e7).max().unwrap()),
             e7(hs.iter().map(|h| h.max_lat_e7).max().unwrap()),
         );
+        let out = PartialOutput::new(output)?;
         let mut writer = PmtilesWriter::create(
-            output, min_z, max_z, bounds, layer_name, elevation_attr, self.groups.len() as u64,
+            out.path(), min_z, max_z, bounds, layer_name, elevation_attr, self.groups.len() as u64,
         )?;
-        created(output)?;
 
         let mut merged = 0u64;
         const BATCH: usize = 16_384;
@@ -122,8 +131,15 @@ impl Merge {
             }
         }
         writer.finalize()?;
+        out.commit()?;
         Ok(MergeStats { tiles: self.groups.len() as u64, merged })
     }
+}
+
+/// The first `vector_layers` id in an archive's metadata.
+fn layer_of(r: &PmtilesReader) -> Option<String> {
+    let meta: serde_json::Value = serde_json::from_str(&r.metadata_json().ok()?).ok()?;
+    Some(meta.get("vector_layers")?.get(0)?.get("id")?.as_str()?.to_string())
 }
 
 /// Merge raw (uncompressed) contour MVTs into one: lines with the same

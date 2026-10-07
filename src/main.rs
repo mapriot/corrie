@@ -43,8 +43,6 @@ struct MergeArgs {
     /// Input .pmtiles archives
     #[arg(required = true)]
     inputs: Vec<std::path::PathBuf>,
-    #[arg(long, default_value = "contour")]
-    layer: String,
     #[arg(short = 'j', long)]
     workers: Option<usize>,
 }
@@ -101,6 +99,11 @@ struct TileArgs {
     /// `--cache-dir`; ignored otherwise).
     #[arg(long)]
     rebuild_cache: bool,
+    /// Build one archive per group of sources (e.g. per country folder) in
+    /// this directory, reusing archives whose inputs are unchanged, then
+    /// merge them into OUTPUT. The temp cache only ever holds one group.
+    #[arg(long, value_name = "DIR")]
+    shards: Option<std::path::PathBuf>,
     #[arg(short = 'j', long)]
     workers: Option<usize>,
 }
@@ -262,158 +265,39 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_tile(args: TileArgs) -> anyhow::Result<()> {
-    use std::path::PathBuf;
-    use anyhow::Context;
+    use corrie::build::{tile_sources, Cache};
     use corrie::config::{parse, parse_and_resolve};
-    use corrie::ingest;
-    use corrie::feature_store::{Reader, cache_valid};
-    use corrie::spatial_index::load_rtree;
-    use corrie::tile_gen::{hilbert_sort, process_tile};
-    use corrie::container::pmtiles::{gzip_tile, tile_id, PmtilesWriter};
 
     if let Some(w) = args.workers {
         rayon::ThreadPoolBuilder::new().num_threads(w).build_global()
             .context("rayon")?;
     }
-
     let cfg = parse(&args.config)?;
     let sources = parse_and_resolve(&args.config)?;
+    // All sources go into one MVT layer: the output layer of the first
+    // source in config order (mapriot: "contour").
+    let layer = sources.first().context("no layers in config")?.output_layer_name.clone();
+    let t0 = std::time::Instant::now();
 
-    // Cache resolution:
-    //   --cache-dir <path>   → persistent, reused if SHP hash matches
-    //   (omitted)            → tempfile::TempDir, dropped at end of run
-    //
-    // Hold the TempDir alive for the whole function so the cache files
-    // survive until tile generation completes.
-    let _temp_cache: Option<tempfile::TempDir>;
-    let (cache_dir, persistent) = match args.cache_dir.clone() {
-        Some(p) => {
-            _temp_cache = None;
-            (p, true)
+    match &args.shards {
+        Some(shard_dir) => {
+            if args.cache_dir.is_some() {
+                anyhow::bail!("--shards builds each group with its own temp cache; drop --cache-dir");
+            }
+            let base_dir = args.config.parent().unwrap_or(std::path::Path::new("."));
+            let s = corrie::shards::build(&sources, &cfg.settings, &layer, base_dir, shard_dir, &args.output)?;
+            eprintln!("Done in {:.1}s: {} groups ({} built, {} reused), {} tiles",
+                t0.elapsed().as_secs_f64(), s.groups, s.built, s.reused, s.tiles);
         }
         None => {
-            corrie::temp_cache::reap_orphan_caches();
-            let td = corrie::temp_cache::create_ephemeral_cache()?;
-            let path = td.path().to_path_buf();
-            corrie::cleanup::remove_on_signal(&path)?;
-            _temp_cache = Some(td);
-            (path, false)
-        }
-    };
-
-    let shp_paths: Vec<PathBuf> = sources.iter().map(|s| s.shp_path.clone()).collect();
-    let needs_ingest = !persistent || args.rebuild_cache || !cache_valid(&cache_dir, &shp_paths);
-    if needs_ingest {
-        if persistent {
-            eprintln!("Ingesting {} SHPs into {:?} ...", shp_paths.len(), cache_dir);
-        } else {
-            eprintln!("Ingesting {} SHPs (ephemeral, no cache will be kept) ...", shp_paths.len());
-        }
-        let t0 = std::time::Instant::now();
-        let stats = ingest::run(&sources, &cache_dir)?;
-        eprintln!("Ingested {} features ({} vertices) in {:.2}s",
-            stats.features, stats.vertices, t0.elapsed().as_secs_f64());
-    } else {
-        eprintln!("Using cached feature store in {:?}", cache_dir);
-    }
-
-    let reader = Reader::open(&cache_dir)?;
-    let rtree = load_rtree(&cache_dir)?;
-
-    // Output layer name: assume single output layer (all SHPs write_to the same target).
-    // For mapriot's config this is always "contour".
-    let output_layer = sources.first()
-        .map(|s| s.output_layer_name.clone())
-        .unwrap_or_else(|| "contour".to_string());
-
-    // Enumerate tiles. The config bbox may be enormous (mapriot uses the
-    // whole world, [-180,-85,180,85]) but actual feature coverage is much
-    // smaller. Intersect with the R-tree's root envelope so we don't walk
-    // 100s of millions of ocean tiles that would all early-out empty.
-    use corrie::mercator::{lat2latp, latp2lat};
-    use corrie::spatial_index::rtree_bbox;
-    let cfg_bb = cfg.settings.bounding_box;
-    let cfg_min_latp = lat2latp(cfg_bb[1]);
-    let cfg_max_latp = lat2latp(cfg_bb[3]);
-    let bbox = match rtree_bbox(&rtree) {
-        Some((rmin_lon, rmin_latp, rmax_lon, rmax_latp)) => {
-            let min_lon = cfg_bb[0].max(rmin_lon);
-            let max_lon = cfg_bb[2].min(rmax_lon);
-            let min_latp = cfg_min_latp.max(rmin_latp);
-            let max_latp = cfg_max_latp.min(rmax_latp);
-            if min_lon > max_lon || min_latp > max_latp {
-                eprintln!("Feature bbox does not intersect config bounding_box; nothing to do.");
-                [0.0, 0.0, 0.0, 0.0]
-            } else {
-                [min_lon, latp2lat(min_latp), max_lon, latp2lat(max_latp)]
-            }
-        }
-        None => {
-            eprintln!("No features in ingest; nothing to do.");
-            [0.0, 0.0, 0.0, 0.0]
-        }
-    };
-    use corrie::tile_gen::enumerate_tiles_pruned;
-    let mut tiles = enumerate_tiles_pruned(&rtree, bbox, cfg.settings.minzoom, cfg.settings.maxzoom);
-    eprintln!("{} tiles to process (quadtree-pruned)", tiles.len());
-    hilbert_sort(&mut tiles);
-
-    // PMTiles writer.
-    let (w, s, e, n) = (
-        cfg.settings.bounding_box[0], cfg.settings.bounding_box[1],
-        cfg.settings.bounding_box[2], cfg.settings.bounding_box[3]
-    );
-    let mut writer = PmtilesWriter::create(
-        &args.output, cfg.settings.minzoom, cfg.settings.maxzoom,
-        (w, s, e, n), &output_layer, "elevation", tiles.len() as u64,
-    )?;
-    corrie::cleanup::remove_on_signal(&args.output)?;
-
-    // Parallel tile-gen via rayon, serial write through the PMTiles writer
-    // (the writer's clustered=true layout requires monotonically increasing
-    // tile_id, so we collect each chunk's results and add_tile them in
-    // Hilbert order).
-    let pb = indicatif::ProgressBar::new(tiles.len() as u64);
-    pb.set_style(
-        indicatif::ProgressStyle::with_template(
-            "[{elapsed_precise}] {bar:45.cyan/blue} {pos:>6}/{len} tiles  {tiles_per_sec}/s  eta {eta}",
-        )
-        .unwrap()
-        .with_key(
-            "tiles_per_sec",
-            |state: &ProgressState, w: &mut dyn std::fmt::Write| {
-                write!(w, "{}", state.per_sec() as u64).unwrap();
-            },
-        ),
-    );
-
-    const CHUNK: usize = 4096;
-
-    let mut written = 0u64;
-    // Workers build and gzip tiles; the main thread only appends bytes.
-    for chunk in tiles.chunks(CHUNK) {
-        let results: Vec<anyhow::Result<Option<Vec<u8>>>> = chunk
-            .par_iter()
-            .map(|&t| {
-                let r = process_tile(t, &reader, &rtree, &sources, &output_layer, "elevation")
-                    .map(|mvt| gzip_tile(&mvt))
-                    .transpose();
-                pb.inc(1);
-                r
-            })
-            .collect();
-        for (i, gz) in results.into_iter().enumerate() {
-            if let Some(gz) = gz? {
-                let t = chunk[i];
-                writer.add_tile_gzipped(tile_id(t.z, t.x, t.y), &gz)?;
-                written += 1;
-            }
+            let cache = match &args.cache_dir {
+                Some(dir) => Cache::Persistent { dir, rebuild: args.rebuild_cache },
+                None => Cache::Ephemeral,
+            };
+            tile_sources(&sources, &cfg.settings, &layer, &args.output, cache, &[])?;
+            eprintln!("Done in {:.1}s", t0.elapsed().as_secs_f64());
         }
     }
-    pb.finish();
-    eprintln!("Wrote {} non-empty tiles", written);
-    writer.finalize()?;
-    corrie::cleanup::forget_on_signal(&args.output);
     Ok(())
 }
 
@@ -423,8 +307,7 @@ fn run_merge(args: MergeArgs) -> anyhow::Result<()> {
     }
     let t0 = std::time::Instant::now();
     let merge = corrie::merge::Merge::open(&args.inputs)?;
-    let stats = merge.write(&args.output, &args.layer, "elevation", |out| corrie::cleanup::remove_on_signal(out))?;
-    corrie::cleanup::forget_on_signal(&args.output);
+    let stats = merge.write(&args.output, "elevation")?;
     eprintln!("Merged {} archives: {} tiles, {} present in several inputs, in {:.1}s",
         args.inputs.len(), stats.tiles, stats.merged, t0.elapsed().as_secs_f64());
     Ok(())
