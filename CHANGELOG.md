@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0 — 2026-10-07
+
+### Added
+
+- `corrie pack --drop-seams DEG`: leave out features whose every vertex lies
+  within `DEG` degrees of a whole-degree meridian or parallel, the lines
+  contouring traces along the seams of 1° DEM tiles (JAXA AW3D30) where data
+  meets nodata. A feature with one vertex elsewhere is kept whole. The option
+  is recorded in the pack and is part of what makes it current; packs made
+  without it stay current.
+
 ## 0.3.0 — 2026-10-07
 
 ### Added
