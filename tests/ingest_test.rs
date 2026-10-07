@@ -25,3 +25,20 @@ fn ingest_tiny_fixture() {
     let shp_paths: Vec<_> = sources.iter().map(|s| s.shp_path.clone()).collect();
     assert!(cache_valid(&cache, &shp_paths));
 }
+
+#[test]
+fn failed_reingest_leaves_the_cache_invalid() {
+    let (dir, shp, cfg) = common::make_tiny_fixture();
+    let sources = parse_and_resolve(&cfg).unwrap();
+    let cache = dir.path().join(".corrie-cache");
+    ingest::run(&sources, &cache).expect("first ingest");
+    let shp_paths: Vec<_> = sources.iter().map(|s| s.shp_path.clone()).collect();
+    assert!(cache_valid(&cache, &shp_paths));
+
+    // A second ingest that fails halfway (here: its SHP is gone) must not
+    // leave the first run's manifest next to rewritten data files.
+    std::fs::rename(&shp, dir.path().join("moved.shp")).unwrap();
+    assert!(ingest::run(&sources, &cache).is_err());
+    assert!(!cache.join("manifest.bin").exists());
+    assert!(!cache_valid(&cache, &shp_paths));
+}

@@ -57,6 +57,18 @@ pub fn run(
     cache_dir: &Path,
 ) -> Result<IngestStats> {
     std::fs::create_dir_all(cache_dir).with_context(|| format!("mkdir {:?}", cache_dir))?;
+    // The manifest is what marks a cache as complete and valid. Drop the old
+    // one first, so an ingest that is interrupted halfway through rewriting a
+    // persistent cache leaves it invalid instead of half-new under a
+    // still-matching manifest.
+    match std::fs::remove_file(cache_dir.join("manifest.bin")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e).context("remove old manifest.bin"),
+        _ => {}
+    }
+    // Hash the SHP set (paths, sizes, mtimes) before reading it: an SHP that
+    // changes while it is being read then no longer matches the manifest.
+    let shp_paths: Vec<PathBuf> = sources.iter().map(|s| s.shp_path.clone()).collect();
+    let source_hash = compute_source_hash(&shp_paths)?;
 
     // Build elevation-column lookup per source (default "elevation"; use first
     // entry of source_columns if explicit).
@@ -163,8 +175,6 @@ pub fn run(
     save_rtree(&tree, cache_dir)?;
 
     // Manifest: source hash + layer name table.
-    let shp_paths: Vec<PathBuf> = sources.iter().map(|s| s.shp_path.clone()).collect();
-    let source_hash = compute_source_hash(&shp_paths)?;
     // Distinct output layer names, preserving config order.
     let mut layer_names: Vec<String> = Vec::new();
     for s in sources {
