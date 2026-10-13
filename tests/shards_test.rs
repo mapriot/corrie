@@ -158,3 +158,53 @@ fn moving_groups_to_packs_keeps_the_tiles() {
     assert!(log(&packs).contains("1 built, 1 reused"), "{}", log(&packs));
     same("shp.pmtiles", "packs.pmtiles");
 }
+
+/// --per-group makes one pack per group from its sources (shapefiles or
+/// packs) and a config with one layer per group; the tiles stay the same.
+#[test]
+fn one_pack_per_group_keeps_the_tiles() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    for g in ["a", "b"] {
+        std::fs::create_dir_all(d.join(g)).unwrap();
+    }
+    common::write_shapefile_at(&d.join("a"), "one.shp", 14.0);
+    common::write_shapefile_at(&d.join("a"), "two.shp", 14.2);
+    common::write_shapefile_at(&d.join("b"), "tiny.shp", 14.4);
+    let layer = |src: &str, extra: &str| format!(
+        r#"{{"minzoom": 11, "maxzoom": 14, "source": "{src}", "source_columns": ["elevation"], "write_to": "contour",
+           "simplify_below": 14, "simplify_level": 0.00005, "simplify_ratio": 2{extra}}}"#);
+    let config = |extra: &str| format!(
+        r#"{{"settings": {{"minzoom": 11, "maxzoom": 14, "bounding_box": [-180, -85, 180, 85]}},
+           "layers": {{"a1": {}, "a2": {}, "b0": {}}}}}"#, layer("a/one.shp", ""), layer("a/two.shp", extra), layer("b/tiny.shp", ""));
+    std::fs::write(d.join("config.json"), config("")).unwrap();
+    let p = |n: &str| d.join(n).to_str().unwrap().to_string();
+    let log = |o: &Output| String::from_utf8_lossy(&o.stderr).into_owned();
+    corrie(&["tile", &p("config.json"), &p("shp.pmtiles")]);
+
+    // from packs, as on a machine that only has the packs left
+    corrie(&["pack", "--config", &p("config.json")]);
+    let grouped = corrie(&["pack", "--config", &p("config-packs.json"), "--per-group", "--out-config", &p("groups.json")]);
+    assert!(log(&grouped).contains("2 groups read one pack each"), "{}", log(&grouped));
+    assert!(d.join("a/a.cpk").exists() && d.join("b/b.cpk").exists());
+    let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(p("groups.json")).unwrap()).unwrap();
+    let layers = cfg["layers"].as_object().unwrap();
+    assert_eq!(layers.keys().collect::<Vec<_>>(), ["a", "b"]);
+    assert_eq!(layers["a"]["source"], "a/a.cpk");
+    assert_eq!(layers["a"]["write_to"], "contour");
+    assert_eq!(cfg["settings"]["maxzoom"], 14);
+
+    corrie(&["tile", &p("groups.json"), &p("groups.pmtiles")]);
+    let cmp = corrie(&["compare", &p("shp.pmtiles"), &p("groups.pmtiles")]);
+    assert!(cmp.status.success(), "{}", String::from_utf8_lossy(&cmp.stdout));
+
+    // again: everything is current
+    let again = corrie(&["pack", "--config", &p("config-packs.json"), "--per-group", "--out-config", &p("groups.json")]);
+    assert!(!log(&again).contains("Packing"), "{}", log(&again));
+
+    // a group whose layers differ in more than their source stays as it is
+    std::fs::write(d.join("config.json"), config(r#", "simplify_length": 10"#)).unwrap();
+    let bad = Command::new(env!("CARGO_BIN_EXE_corrie"))
+        .args(["pack", "--config", &p("config.json"), "--per-group"]).output().unwrap();
+    assert!(!bad.status.success() && log(&bad).contains("differ in more than their source"), "{}", log(&bad));
+}

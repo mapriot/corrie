@@ -68,8 +68,8 @@ struct MergeArgs {
 
 #[derive(clap::Args, Debug)]
 struct PackArgs {
-    /// Source files (SHP, FlatGeobuf, GeoPackage, anything GDAL reads); each
-    /// becomes <name>.cpk next to it
+    /// Source files (SHP, FlatGeobuf, GeoPackage, anything GDAL reads, or
+    /// packs); each becomes <name>.cpk next to it, or with -o all one pack
     #[arg(required_unless_present = "config")]
     inputs: Vec<std::path::PathBuf>,
     /// Pack every source of this tilemaker config next to its file instead,
@@ -89,9 +89,18 @@ struct PackArgs {
     /// source_columns, or elevation)
     #[arg(long, default_value = "elevation")]
     field: String,
+    /// Pack all inputs (vector files and packs) into this one pack instead
+    #[arg(short = 'o', long, value_name = "FILE", conflicts_with = "config")]
+    out: Option<std::path::PathBuf>,
+    /// With --config: one pack per group (the folders --shards builds by),
+    /// <folder>/<group>.cpk, from its sources, vector files or packs; the
+    /// config copy gets one layer per group
+    #[arg(long, requires = "config")]
+    per_group: bool,
     /// Leave out lines whose every vertex lies within DEG degrees of a
     /// whole-degree meridian or parallel: contours traced along the seams of
-    /// 1° DEM tiles such as JAXA AW3D30, where data meets nodata (e.g. 0.001)
+    /// 1° DEM tiles such as JAXA AW3D30, where data meets nodata (e.g. 0.001).
+    /// Applies to vector files, not to packs packed again
     #[arg(long, value_name = "DEG")]
     drop_seams: Option<f64>,
     /// Pack again even when an up-to-date pack exists
@@ -467,20 +476,23 @@ fn run_compare(args: CompareArgs) -> anyhow::Result<()> {
 }
 
 fn run_pack(args: PackArgs) -> anyhow::Result<()> {
-    use corrie::pack::{is_current, pack_files, PackOptions};
+    use corrie::pack::{is_current, pack_files, PackJob, PackOptions};
     use std::path::{Path, PathBuf};
 
     if let Some(w) = args.workers {
         rayon::ThreadPoolBuilder::new().num_threads(w).build_global().context("rayon")?;
     }
-    // (source, elevation field, pack) for every source to pack, and with
-    // --config the layers whose source turns into its pack
-    let mut all: Vec<(PathBuf, String, PathBuf)> = Vec::new();
+    let opts = PackOptions { drop_seams: args.drop_seams };
+    let field_of = |s: &corrie::config::SourceLayer| s.source_columns.first().cloned().unwrap_or_else(|| "elevation".to_string());
+    let mut jobs: Vec<PackJob> = Vec::new();
+    // with --config: the layers whose source becomes its pack, or with
+    // --per-group the groups that become one pack each
     let mut switched: Vec<String> = Vec::new();
+    let mut grouped: Vec<(corrie::shards::Group, PathBuf)> = Vec::new();
     match &args.config {
         Some(cfg) => {
             let sources = corrie::config::parse_and_resolve(cfg)?;
-            let chosen = if args.only.is_empty() { sources } else {
+            let chosen: Vec<corrie::config::SourceLayer> = if args.only.is_empty() && !args.per_group { sources } else {
                 // the groups --shards builds, so the names match its archives
                 let groups = corrie::shards::group_sources(&sources)?;
                 for name in &args.only {
@@ -489,47 +501,69 @@ fn run_pack(args: PackArgs) -> anyhow::Result<()> {
                         anyhow::bail!("--only: no group {:?} in {:?} (groups: {})", name, cfg, names.join(", "));
                     }
                 }
-                groups.into_iter().filter(|g| args.only.contains(&g.name)).flat_map(|g| g.sources).collect()
+                let groups = groups.into_iter().filter(|g| args.only.is_empty() || args.only.contains(&g.name));
+                if args.per_group {
+                    for g in groups {
+                        let out = match &g.folder {
+                            Some(dir) => dir.join(format!("{}.cpk", g.name)),
+                            None => g.sources[0].shp_path.with_extension("cpk"),
+                        };
+                        // a group that already is that one pack has nothing to do
+                        if !(g.sources.len() == 1 && g.sources[0].shp_path == out) {
+                            jobs.push(PackJob { sources: g.sources.iter().map(|s| (s.shp_path.clone(), field_of(s))).collect(), out: out.clone() });
+                            grouped.push((g, out));
+                        }
+                    }
+                    Vec::new()
+                } else {
+                    groups.flat_map(|g| g.sources).collect()
+                }
             };
             for s in chosen {
                 if corrie::build::is_pack(&s.shp_path) { continue; }
-                let field = s.source_columns.first().cloned().unwrap_or_else(|| "elevation".to_string());
-                all.push((s.shp_path.clone(), field, s.shp_path.with_extension("cpk")));
+                jobs.push(PackJob { sources: vec![(s.shp_path.clone(), field_of(&s))], out: s.shp_path.with_extension("cpk") });
                 switched.push(s.source_layer_name);
             }
         }
-        None => {
-            for p in &args.inputs {
-                all.push((p.clone(), args.field.clone(), p.with_extension("cpk")));
-            }
-        }
+        None => match &args.out {
+            Some(out) => jobs.push(PackJob {
+                sources: args.inputs.iter().map(|p| (p.clone(), args.field.clone())).collect(),
+                out: out.clone(),
+            }),
+            None => for p in &args.inputs {
+                jobs.push(PackJob { sources: vec![(p.clone(), args.field.clone())], out: p.with_extension("cpk") });
+            },
+        },
     }
     let mut seen = std::collections::HashSet::new();
-    for (src, _, out) in &all {
-        if !seen.insert(out.clone()) {
-            anyhow::bail!("two sources would write {:?} (e.g. {:?}); rename one", out, src);
+    for job in &jobs {
+        if !seen.insert(job.out.clone()) {
+            anyhow::bail!("two packs would be written to {:?}; rename a source", job.out);
+        }
+        if job.sources.len() > 1 && job.sources.iter().any(|(src, _)| src == &job.out) {
+            anyhow::bail!("{:?} is one of the sources of the pack to write over it; move or rename it", job.out);
         }
     }
-    let opts = PackOptions { drop_seams: args.drop_seams };
-    let todo: Vec<_> = all.iter().filter(|(src, field, out)| args.force || !is_current(out, src, field, &opts)).cloned().collect();
+    let todo: Vec<PackJob> = jobs.iter().filter(|j| args.force || !is_current(&j.out, &j.sources, &opts)).cloned().collect();
     let t0 = std::time::Instant::now();
     if !todo.is_empty() {
-        corrie::log!("Packing {} ({} already up to date) ...", corrie::count(todo.len() as u64, "source"), all.len() - todo.len());
+        corrie::log!("Packing {} ({} already up to date) ...", corrie::count(todo.len() as u64, "pack"), jobs.len() - todo.len());
         let seams = pack_files(&todo, &opts)?;
         if opts.drop_seams.is_some() {
             corrie::log!("Left out {} lines along degree seams", seams);
         }
     }
     let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-    let source_bytes: u64 = all.iter().map(|(src, _, _)| {
+    let source_bytes: u64 = jobs.iter().flat_map(|j| &j.sources).map(|(src, _)| {
         if src.extension().is_some_and(|e| e.eq_ignore_ascii_case("shp")) {
             ["shp", "shx", "dbf"].iter().map(|e| size(&src.with_extension(e))).sum()
         } else { size(src) }
     }).sum();
-    let pack_bytes: u64 = all.iter().map(|(_, _, out)| size(out)).sum();
-    corrie::log!("{}: {:.2} GB of sources -> {:.2} GB of packs ({:.1}x smaller), {:.1}s",
-        corrie::count(all.len() as u64, "pack"), source_bytes as f64 / 1e9, pack_bytes as f64 / 1e9,
-        source_bytes as f64 / pack_bytes.max(1) as f64, t0.elapsed().as_secs_f64());
+    let pack_bytes: u64 = jobs.iter().map(|j| size(&j.out)).sum();
+    let ratio = source_bytes as f64 / pack_bytes.max(1) as f64;
+    corrie::log!("{}: {:.2} GB of sources -> {:.2} GB of packs{}, {:.1}s",
+        corrie::count(jobs.len() as u64, "pack"), source_bytes as f64 / 1e9, pack_bytes as f64 / 1e9,
+        if ratio >= 1.1 { format!(" ({ratio:.1}x smaller)") } else { String::new() }, t0.elapsed().as_secs_f64());
 
     if let Some(cfg) = &args.config {
         let out = args.out_config.clone().unwrap_or_else(|| {
@@ -537,13 +571,72 @@ fn run_pack(args: PackArgs) -> anyhow::Result<()> {
             cfg.with_file_name(format!("{stem}-packs.json"))
         });
         let text = std::fs::read_to_string(cfg).with_context(|| format!("read {:?}", cfg))?;
-        let text = switch_sources(&text, &switched).with_context(|| format!("rewrite {:?}", cfg))?;
+        let (text, summary) = if args.per_group {
+            (regroup_layers(&text, cfg, &grouped).with_context(|| format!("rewrite {:?}", cfg))?,
+             format!("{} read one pack each", corrie::count(grouped.len() as u64, "group")))
+        } else {
+            (switch_sources(&text, &switched).with_context(|| format!("rewrite {:?}", cfg))?,
+             format!("{} switched to packs", corrie::count(switched.len() as u64, "source")))
+        };
         let o = corrie::cleanup::PartialOutput::new(&out)?;
         std::fs::write(o.path(), text).with_context(|| format!("write {:?}", o.path()))?;
         o.commit()?;
-        corrie::log!("Wrote {:?}: {} switched to packs", out, corrie::count(switched.len() as u64, "source"));
+        corrie::log!("Wrote {:?}: {}", out, summary);
     }
     Ok(())
+}
+
+/// The config with each group's layers replaced by one layer named after the
+/// group, reading the group's pack. The group's layers must agree on
+/// everything but their source (an implied `write_to`, the layer's own name,
+/// is made explicit). Other top-level fields keep their values; layers are
+/// written one per line.
+fn regroup_layers(text: &str, cfg: &std::path::Path, groups: &[(corrie::shards::Group, std::path::PathBuf)]) -> anyhow::Result<String> {
+    use serde_json::Value;
+    let doc: Value = serde_json::from_str(text)?;
+    let layers = doc["layers"].as_object().context("the config has no layers")?;
+    let base = cfg.parent().unwrap_or(std::path::Path::new(""));
+    let mut out: std::collections::BTreeMap<String, Value> = layers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    for (g, pack) in groups {
+        // a layer without its source, its output layer named
+        let settings = |key: &str| -> anyhow::Result<Value> {
+            let mut v = layers.get(key).with_context(|| format!("no layer {key:?}"))?.clone();
+            let o = v.as_object_mut().with_context(|| format!("layer {key:?} is not an object"))?;
+            o.remove("source");
+            o.entry("write_to").or_insert_with(|| Value::from(key));
+            Ok(v)
+        };
+        let first = &g.sources[0].source_layer_name;
+        let mut layer = settings(first)?;
+        for s in &g.sources[1..] {
+            if settings(&s.source_layer_name)? != layer {
+                anyhow::bail!("layers {:?} and {:?} of group {:?} differ in more than their source; \
+                               give them the same settings to make the group one pack", first, s.source_layer_name, g.name);
+            }
+        }
+        for s in &g.sources {
+            out.remove(&s.source_layer_name);
+        }
+        if out.contains_key(&g.name) {
+            anyhow::bail!("group {:?} would be named like another layer of the config", g.name);
+        }
+        layer["source"] = pack.strip_prefix(base).unwrap_or(pack).to_string_lossy().into_owned().into();
+        out.insert(g.name.clone(), layer);
+    }
+    let mut s = String::from("{\n");
+    for (k, v) in doc.as_object().context("the config is not an object")? {
+        if k == "layers" { continue; }
+        s += &format!("  {}: {},\n", serde_json::to_string(k)?, serde_json::to_string_pretty(v)?.replace('\n', "\n  "));
+    }
+    s += "  \"layers\": {\n";
+    for (i, (k, v)) in out.iter().enumerate() {
+        let comma = if i + 1 < out.len() { "," } else { "" };
+        s += &format!("    {}: {}{}\n", serde_json::to_string(k)?, serde_json::to_string(v)?, comma);
+    }
+    s += "  }\n}\n";
+    let check: Value = serde_json::from_str(&s)?;
+    anyhow::ensure!(check["layers"].as_object().map(|l| l.len()) == Some(out.len()), "the rewritten config does not parse back");
+    Ok(s)
 }
 
 /// The config text with the source of each layer in `layers` ending in .cpk

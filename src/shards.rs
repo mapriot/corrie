@@ -42,6 +42,8 @@ const META_FIELD: &str = "corrie_shard";
 pub struct Group {
     pub name: String,
     pub sources: Vec<SourceLayer>,
+    /// The group's folder; None for a file lying directly in the common one.
+    pub folder: Option<PathBuf>,
 }
 
 /// Split sources into groups (see the module docs), sorted by name.
@@ -62,17 +64,17 @@ pub fn group_sources(sources: &[SourceLayer]) -> Result<Vec<Group>> {
         let rel = s.shp_path.strip_prefix(&root).unwrap_or(&s.shp_path);
         let mut comps = rel.components();
         let first = comps.next().context("source path is empty")?;
-        let raw = if comps.next().is_some() {
-            first.as_os_str().to_string_lossy().into_owned()
+        let (raw, folder) = if comps.next().is_some() {
+            (first.as_os_str().to_string_lossy().into_owned(), Some(root.join(first.as_os_str())))
         } else {
-            s.shp_path.file_stem().unwrap_or_default().to_string_lossy().into_owned()
+            (s.shp_path.file_stem().unwrap_or_default().to_string_lossy().into_owned(), None)
         };
         let name: String = raw.chars()
             .map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' })
             .collect();
         match groups.iter_mut().find(|g| g.name == name) {
             Some(g) => g.sources.push(s.clone()),
-            None => groups.push(Group { name, sources: vec![s.clone()] }),
+            None => groups.push(Group { name, sources: vec![s.clone()], folder }),
         }
     }
     groups.sort_by(|a, b| a.name.cmp(&b.name));
@@ -275,7 +277,7 @@ mod tests {
         std::fs::create_dir_all(shp.parent().unwrap()).unwrap();
         std::fs::write(&shp, b"one").unwrap();
         std::fs::write(shp.with_extension("dbf"), b"dbf").unwrap();
-        let group = Group { name: "cz".into(), sources: vec![src("a", shp.to_str().unwrap())] };
+        let group = Group { name: "cz".into(), sources: vec![src("a", shp.to_str().unwrap())], folder: None };
         let settings = Settings {
             minzoom: 11, maxzoom: 14, basezoom: None, include_ids: false,
             bounding_box: [-180.0, -85.0, 180.0, 85.0], compress: "gzip".into(),
@@ -288,7 +290,7 @@ mod tests {
         s2.maxzoom = 15;
         assert_ne!(k, group_key(&group, &s2, "contour", dir.path()).unwrap(), "zoom range");
 
-        let mut g2 = Group { name: "cz".into(), sources: group.sources.clone() };
+        let mut g2 = Group { name: "cz".into(), sources: group.sources.clone(), folder: None };
         g2.sources[0].simplify_level = 0.0001;
         assert_ne!(k, group_key(&g2, &settings, "contour", dir.path()).unwrap(), "layer settings");
 
@@ -315,7 +317,7 @@ mod tests {
         std::fs::create_dir_all(cpk.parent().unwrap()).unwrap();
         std::fs::write(&cpk, b"pack").unwrap();
         std::fs::write(cpk.with_extension("dbf"), b"dbf").unwrap();
-        let group = Group { name: "cz".into(), sources: vec![src("a", cpk.to_str().unwrap())] };
+        let group = Group { name: "cz".into(), sources: vec![src("a", cpk.to_str().unwrap())], folder: None };
         let settings = Settings {
             minzoom: 11, maxzoom: 14, basezoom: None, include_ids: false,
             bounding_box: [-180.0, -85.0, 180.0, 85.0], compress: "gzip".into(),

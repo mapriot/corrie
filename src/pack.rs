@@ -231,6 +231,20 @@ impl PackWriter {
             let g = [to_grid(c[0]), to_grid(c[1])];
             if self.grid.last() != Some(&g) { self.grid.push(g); }
         }
+        self.push_grid_line(elevation)
+    }
+
+    /// Add a line given as grid cells, e.g. decoded from another pack (so
+    /// packing a pack again is lossless).
+    pub fn add_cells(&mut self, cells: &[[u32; 2]], elevation: i16) -> Result<()> {
+        self.grid.clear();
+        for g in cells {
+            if self.grid.last() != Some(g) { self.grid.push(*g); }
+        }
+        self.push_grid_line(elevation)
+    }
+
+    fn push_grid_line(&mut self, elevation: i16) -> Result<()> {
         let n = self.grid.len();
         if n < 2 { return Ok(()); }
         let line = u32::try_from(self.lines.len()).context("more than 4 billion lines in one pack")?;
@@ -328,47 +342,86 @@ impl PackWriter {
 /// Pack the polylines of a GDAL-readable vector file (SHP, FlatGeobuf,
 /// GeoPackage, …) into `out`. `meta` gets the source's path and size/mtime
 /// and the options.
+/// Pack the polylines of a GDAL-readable vector file (SHP, FlatGeobuf,
+/// GeoPackage, …) into `out`.
 pub fn pack_vector_file(source: &Path, elevation_field: &str, out: &Path, opts: &PackOptions) -> Result<PackStats> {
+    pack_sources(&[(source.to_path_buf(), elevation_field.to_string())], out, opts)
+}
+
+/// Pack sources into one pack, in the order given: vector files (with the
+/// column holding the elevation) and packs, whose lines are copied as they
+/// are. `--drop-seams` applies to vector files only. The pack's metadata
+/// records each source's path, size and modification time, and the options.
+pub fn pack_sources(sources: &[(PathBuf, String)], out: &Path, opts: &PackOptions) -> Result<PackStats> {
     let mut w = PackWriter::create(out)?;
-    let seam_features = crate::shapefile_read::read_polylines_streaming(source, elevation_field, opts.drop_seams, |f| {
-        w.add_line(&f.coords, f.elevation)
-    }).with_context(|| format!("read {:?}", source))?;
-    let m = std::fs::metadata(source).with_context(|| format!("stat {:?}", source))?;
-    let meta = serde_json::json!({
-        "source": source.to_string_lossy(),
-        "source_size": m.len(),
-        "source_mtime_ns": mtime_ns(&m).to_string(),
-        "elevation_field": elevation_field,
-        "drop_seams": opts.drop_seams,
-        "corrie": env!("CARGO_PKG_VERSION"),
-    });
+    let mut seam_features = 0;
+    let mut recorded = Vec::new();
+    for (source, field) in sources {
+        if crate::build::is_pack(source) {
+            let p = Pack::open(source)?;
+            p.for_each_line(|elevation, cells| w.add_cells(cells, elevation))
+                .with_context(|| format!("read {:?}", source))?;
+        } else {
+            seam_features += crate::shapefile_read::read_polylines_streaming(source, field, opts.drop_seams, |f| {
+                w.add_line(&f.coords, f.elevation)
+            }).with_context(|| format!("read {:?}", source))?;
+        }
+        let m = std::fs::metadata(source).with_context(|| format!("stat {:?}", source))?;
+        recorded.push(serde_json::json!({
+            "source": source.to_string_lossy(),
+            "source_size": m.len(),
+            "source_mtime_ns": mtime_ns(&m).to_string(),
+            "elevation_field": field,
+        }));
+    }
+    // one source: its fields at the top level, as packs have always had them
+    let mut meta = match recorded.len() {
+        1 => recorded.pop().unwrap(),
+        _ => serde_json::json!({ "sources": recorded }),
+    };
+    meta["drop_seams"] = serde_json::json!(opts.drop_seams);
+    meta["corrie"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
     Ok(PackStats { seam_features, ..w.finish(&meta)? })
 }
 
-/// Does the pack at `pack` hold `source` as it is now (same path, size,
-/// modification time, elevation field and options)?
-pub fn is_current(pack: &Path, source: &Path, field: &str, opts: &PackOptions) -> bool {
-    let (Ok(p), Ok(m)) = (Pack::open(pack), std::fs::metadata(source)) else { return false };
+/// Does the pack at `pack` hold `sources` as they are now (same paths in the
+/// same order, sizes, modification times, elevation fields and options)?
+pub fn is_current(pack: &Path, sources: &[(PathBuf, String)], opts: &PackOptions) -> bool {
+    let Ok(p) = Pack::open(pack) else { return false };
     let Ok(meta) = p.meta() else { return false };
-    meta["source"].as_str() == Some(&*source.to_string_lossy())
-        && meta["source_size"].as_u64() == Some(m.len())
-        && meta["source_mtime_ns"].as_str() == Some(&*mtime_ns(&m).to_string())
-        && meta["elevation_field"].as_str() == Some(field)
-        && meta["drop_seams"].as_f64() == opts.drop_seams
+    if meta["drop_seams"].as_f64() != opts.drop_seams { return false; }
+    let recorded: Vec<&serde_json::Value> = match meta["sources"].as_array() {
+        Some(list) => list.iter().collect(),
+        None => vec![&meta],
+    };
+    recorded.len() == sources.len() && recorded.iter().zip(sources).all(|(r, (source, field))| {
+        let Ok(m) = std::fs::metadata(source) else { return false };
+        r["source"].as_str() == Some(&*source.to_string_lossy())
+            && r["source_size"].as_u64() == Some(m.len())
+            && r["source_mtime_ns"].as_str() == Some(&*mtime_ns(&m).to_string())
+            && r["elevation_field"].as_str() == Some(field)
+    })
 }
 
-/// Pack several sources in parallel: (source, elevation field, output pack).
-/// Each pack is written as `<output>.partial` and renamed when complete.
-/// Returns the number of source features left out as degree-seam lines.
-pub fn pack_files(jobs: &[(PathBuf, String, PathBuf)], opts: &PackOptions) -> Result<u64> {
+/// One pack to make: its sources (path, elevation column) and its path.
+#[derive(Debug, Clone)]
+pub struct PackJob {
+    pub sources: Vec<(PathBuf, String)>,
+    pub out: PathBuf,
+}
+
+/// Make several packs in parallel. Each is written as `<output>.partial` and
+/// renamed when complete. Returns the number of source features left out as
+/// degree-seam lines.
+pub fn pack_files(jobs: &[PackJob], opts: &PackOptions) -> Result<u64> {
     use indicatif::{ProgressBar, ProgressStyle};
     use rayon::prelude::*;
     let pb = ProgressBar::new(jobs.len() as u64);
     pb.set_style(ProgressStyle::with_template(
-        "[{elapsed_precise}] {bar:45.green/blue} {pos:>4}/{len} sources  eta {eta}").unwrap());
-    let seams = jobs.par_iter().map(|(source, field, out)| -> Result<u64> {
-        let partial = crate::cleanup::PartialOutput::new(out)?;
-        let stats = pack_vector_file(source, field, partial.path(), opts)?;
+        "[{elapsed_precise}] {bar:45.green/blue} {pos:>4}/{len} packs  eta {eta}").unwrap());
+    let seams = jobs.par_iter().map(|job| -> Result<u64> {
+        let partial = crate::cleanup::PartialOutput::new(&job.out)?;
+        let stats = pack_sources(&job.sources, partial.path(), opts)?;
         partial.commit()?;
         pb.inc(1);
         Ok(stats.seam_features)
@@ -490,6 +543,15 @@ impl Pack {
     /// skipping its first vertex if `skip_first` (the previous chunk of the
     /// same line already ended there).
     pub fn decode_chunk(&self, ci: u32, skip_first: bool, out: &mut Vec<[f64; 2]>) {
+        self.decode_chunk_with(ci, skip_first, |x, y| out.push([from_grid(x), from_grid(y)]));
+    }
+
+    /// Chunk `ci`'s vertices as grid cells.
+    pub fn decode_chunk_cells(&self, ci: u32, skip_first: bool, out: &mut Vec<[u32; 2]>) {
+        self.decode_chunk_with(ci, skip_first, |x, y| out.push([x, y]));
+    }
+
+    fn decode_chunk_with(&self, ci: u32, skip_first: bool, mut f: impl FnMut(u32, u32)) {
         let c = &self.chunks()[ci as usize];
         let n_line = self.lines()[c.line as usize].n_vertices as usize;
         let n = (c.first_vertex as usize + CHUNK_SEGMENTS).min(n_line - 1) - c.first_vertex as usize + 1;
@@ -497,12 +559,36 @@ impl Pack {
         let mut pos = c.data_off as usize;
         let mut x = get_varint(data, &mut pos) as i64;
         let mut y = get_varint(data, &mut pos) as i64;
-        if !skip_first { out.push([from_grid(x as u32), from_grid(y as u32)]); }
+        if !skip_first { f(x as u32, y as u32); }
         for _ in 1..n {
             x += unzigzag(get_varint(data, &mut pos));
             y += unzigzag(get_varint(data, &mut pos));
-            out.push([from_grid(x as u32), from_grid(y as u32)]);
+            f(x as u32, y as u32);
         }
+    }
+
+    /// Every line, in the order it was packed: its elevation and its grid
+    /// cells.
+    pub fn for_each_line(&self, mut f: impl FnMut(i16, &[[u32; 2]]) -> Result<()>) -> Result<()> {
+        let mut order: Vec<(u32, u32, u32)> = self.chunks().iter().enumerate()
+            .map(|(i, c)| (c.line, c.first_vertex, i as u32))
+            .collect();
+        order.sort_unstable();
+        let lines = self.lines();
+        let mut cells = Vec::new();
+        let mut k = 0;
+        while k < order.len() {
+            let line = order[k].0;
+            cells.clear();
+            let mut first = true;
+            while k < order.len() && order[k].0 == line {
+                self.decode_chunk_cells(order[k].2, !first, &mut cells);
+                first = false;
+                k += 1;
+            }
+            f(lines[line as usize].elevation, &cells)?;
+        }
+        Ok(())
     }
 
     /// All vertices of line `li`, in order (for unpacking and tests).
@@ -521,6 +607,55 @@ impl Pack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Packs packed again into one keep every line, cell for cell, in order;
+    /// vector sources can be mixed in.
+    #[test]
+    fn packs_merge_without_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let geojson = |name: &str, lines: &[(i32, &str)]| {
+            let f: Vec<String> = lines.iter().map(|(e, c)| format!(
+                r#"{{"type":"Feature","properties":{{"elevation":{e}}},"geometry":{{"type":"LineString","coordinates":{c}}}}}"#)).collect();
+            let p = dir.path().join(name);
+            std::fs::write(&p, format!(r#"{{"type":"FeatureCollection","features":[{}]}}"#, f.join(","))).unwrap();
+            p
+        };
+        let a = geojson("a.geojson", &[(100, "[[14.1,50.1],[14.2,50.15],[14.3,50.1]]"), (110, "[[14.0,49.9],[14.05,49.95]]")]);
+        let b = geojson("b.geojson", &[(120, "[[-78.5,-1.5],[-78.4,-1.4],[-78.3,-1.45],[-78.2,-1.4]]")]);
+        let c = geojson("c.geojson", &[(130, "[[55.4,-21.1],[55.5,-21.0]]")]);
+        let field = |p: &Path| (p.to_path_buf(), "elevation".to_string());
+        let (pa, pb) = (dir.path().join("a.cpk"), dir.path().join("b.cpk"));
+        pack_vector_file(&a, "elevation", &pa, &PackOptions::default()).unwrap();
+        pack_vector_file(&b, "elevation", &pb, &PackOptions::default()).unwrap();
+        // a long line spans several chunks
+        let long: String = (0..1000).map(|i| format!("[{},{}]", 10.0 + i as f64 * 0.001, 45.0 + (i % 7) as f64 * 0.0003)).collect::<Vec<_>>().join(",");
+        let d = geojson("d.geojson", &[(140, &format!("[{long}]"))]);
+        let pd = dir.path().join("d.cpk");
+        pack_vector_file(&d, "elevation", &pd, &PackOptions::default()).unwrap();
+
+        let all = dir.path().join("all.cpk");
+        let sources = [field(&pa), field(&pb), field(&c), field(&pd)];
+        let stats = pack_sources(&sources, &all, &PackOptions::default()).unwrap();
+        assert_eq!(stats.lines, 5);
+
+        let lines_of = |p: &Path| {
+            let mut v = Vec::new();
+            Pack::open(p).unwrap().for_each_line(|e, cells| { v.push((e, cells.to_vec())); Ok(()) }).unwrap();
+            v
+        };
+        let pc = dir.path().join("c.cpk");
+        pack_vector_file(&c, "elevation", &pc, &PackOptions::default()).unwrap();
+        let expected: Vec<_> = [&pa, &pb, &pc, &pd].iter().flat_map(|p| lines_of(p)).collect();
+        assert_eq!(lines_of(&all), expected);
+        assert!(lines_of(&pd)[0].1.len() > 2 * CHUNK_SEGMENTS);
+
+        // current while every source is unchanged, in the same order
+        assert!(is_current(&all, &sources, &PackOptions::default()));
+        let reordered = [field(&pb), field(&pa), field(&c), field(&pd)];
+        assert!(!is_current(&all, &reordered, &PackOptions::default()));
+        std::fs::write(&c, std::fs::read(&c).unwrap().iter().chain(b" ").copied().collect::<Vec<u8>>()).unwrap();
+        assert!(!is_current(&all, &sources, &PackOptions::default()));
+    }
 
     /// --drop-seams decides per feature, over all its parts: a MultiLineString
     /// with one part off the seams is kept whole.
@@ -550,9 +685,10 @@ mod tests {
         assert_eq!(elevations, vec![120, 120, 130]);
 
         // the option is part of what makes a pack current
-        assert!(is_current(&out, &src, "elevation", &opts));
-        assert!(!is_current(&out, &src, "elevation", &PackOptions::default()));
-        assert!(is_current(&plain, &src, "elevation", &PackOptions::default()));
+        let one = [(src.clone(), "elevation".to_string())];
+        assert!(is_current(&out, &one, &opts));
+        assert!(!is_current(&out, &one, &PackOptions::default()));
+        assert!(is_current(&plain, &one, &PackOptions::default()));
     }
 
     struct Rng(u64);

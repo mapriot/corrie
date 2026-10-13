@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::cleanup::PartialOutput;
 use crate::config::{Settings, SourceLayer};
 use crate::container::pmtiles::{gzip_tile, tile_id, PmtilesWriter};
-use crate::pack::{is_current, pack_files, Pack, PackOptions};
+use crate::pack::{is_current, pack_files, Pack, PackJob, PackOptions};
 use crate::tile_gen::{enumerate_tiles_pruned, hilbert_sort, process_tile};
 
 /// Where packs of the sources that are not packs already (SHP, FlatGeobuf,
@@ -150,14 +150,14 @@ pub fn packs_for(sources: &[SourceLayer], cache_dir: &Path, reuse: bool) -> Resu
     }).collect();
     let todo: Vec<usize> = (0..sources.len())
         .filter(|&i| !is_pack(&sources[i].shp_path))
-        .filter(|&i| !(reuse && is_current(&paths[i], &sources[i].shp_path, &field(&sources[i]), &PackOptions::default())))
+        .filter(|&i| !(reuse && is_current(&paths[i], &[(sources[i].shp_path.clone(), field(&sources[i]))], &PackOptions::default())))
         .collect();
 
     if !todo.is_empty() {
         crate::log!("Packing {} of {} into {:?} ...", todo.len(), crate::count(sources.len() as u64, "source"), cache_dir);
         let t0 = std::time::Instant::now();
-        let jobs: Vec<(PathBuf, String, PathBuf)> = todo.iter()
-            .map(|&i| (sources[i].shp_path.clone(), field(&sources[i]), paths[i].clone()))
+        let jobs: Vec<PackJob> = todo.iter()
+            .map(|&i| PackJob { sources: vec![(sources[i].shp_path.clone(), field(&sources[i]))], out: paths[i].clone() })
             .collect();
         pack_files(&jobs, &PackOptions::default())?;
         crate::log!("Packed {} in {:.1}s", crate::count(todo.len() as u64, "source"), t0.elapsed().as_secs_f64());
