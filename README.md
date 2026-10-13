@@ -18,16 +18,14 @@ Three ways to get corrie, easiest first.
 
 ### Docker — no GDAL or Rust needed
 
-Only Docker is required. Build the image once, then run it:
+Only Docker is required. Run the published image (amd64 and arm64):
 
 ```bash
-git clone https://github.com/mapriot/corrie
-docker build -t corrie corrie
 cd /path/to/your/data
-docker run --rm -v "$PWD:/data" corrie tile config.json contours.pmtiles
+docker run --rm -v "$PWD:/data" ghcr.io/mapriot/corrie tile config.json contours.pmtiles
 ```
 
-The current directory is bind-mounted at `/data`, where corrie runs: relative paths, and the sources a config lists, are resolved inside it.
+The current directory is bind-mounted at `/data`, where corrie runs: relative paths, and the sources a config lists, are resolved inside it. To build the image yourself instead: `git clone https://github.com/mapriot/corrie && docker build -t corrie corrie`.
 
 ### From crates.io
 
@@ -80,7 +78,7 @@ cargo install --path . \
 
 `corrie <command> --help` lists every option.
 
-Every command below is run, in order, by [`examples/readme.sh`](examples/readme.sh) on two neighbouring tiles of the [Copernicus GLO-30](https://dataspace.copernicus.eu/explore-data/data-collections/copernicus-contributing-missions/collections-description/COP-DEM) DEM in the Alps (47–48°N; `west.tif` 12–13°E, `east.tif` 13–14°E), which it downloads; the outputs shown are from that run. `CORRIE_IMAGE=corrie examples/readme.sh` runs them with the Docker image.
+Every command below is run, in order, by [`examples/readme.sh`](examples/readme.sh) on two neighbouring tiles of the [Copernicus GLO-30](https://dataspace.copernicus.eu/explore-data/data-collections/copernicus-contributing-missions/collections-description/COP-DEM) DEM in the Alps (47–48°N; `west.tif` 12–13°E, `east.tif` 13–14°E), which it downloads; the outputs shown are from that run. `CORRIE_IMAGE=ghcr.io/mapriot/corrie examples/readme.sh` runs them with the Docker image.
 
 ### Quick start
 

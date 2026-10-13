@@ -5,7 +5,7 @@
 # on a result that is not what the README says.
 #
 #   examples/readme.sh                       # corrie from PATH
-#   CORRIE_IMAGE=corrie examples/readme.sh   # corrie from the Docker image (docker build -t corrie .)
+#   CORRIE_IMAGE=ghcr.io/mapriot/corrie examples/readme.sh   # corrie from the Docker image
 #
 # Needs curl and GDAL's command-line tools (gdal_contour, gdalwarp,
 # gdalbuildvrt). The DEM tiles are downloaded once into $DATA.
