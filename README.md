@@ -21,12 +21,13 @@ Three ways to get corrie, easiest first.
 Only Docker is required. Build the image once, then run it:
 
 ```bash
-git clone https://github.com/mapriot/corrie && cd corrie
-docker build -t corrie .
-docker run --rm -v "$PWD:/data" corrie tile /data/config.json /data/contours.pmtiles
+git clone https://github.com/mapriot/corrie
+docker build -t corrie corrie
+cd /path/to/your/data
+docker run --rm -v "$PWD:/data" corrie tile config.json contours.pmtiles
 ```
 
-Bind-mount the directory holding your contour lines, rasters and config (and where output goes) at `/data`; paths are resolved inside the container, and a config's sources relative to the config.
+The current directory is bind-mounted at `/data`, where corrie runs: relative paths, and the sources a config lists, are resolved inside it.
 
 ### From crates.io
 
@@ -79,6 +80,8 @@ cargo install --path . \
 
 `corrie <command> --help` lists every option.
 
+Every command below is run, in order, by [`examples/readme.sh`](examples/readme.sh) on two neighbouring tiles of the [Copernicus GLO-30](https://dataspace.copernicus.eu/explore-data/data-collections/copernicus-contributing-missions/collections-description/COP-DEM) DEM in the Alps (47–48°N; `west.tif` 12–13°E, `east.tif` 13–14°E), which it downloads; the outputs shown are from that run. `CORRIE_IMAGE=corrie examples/readme.sh` runs them with the Docker image.
+
 ### Quick start
 
 ```bash
@@ -88,17 +91,17 @@ corrie build dem.tif contours.pmtiles
 # Contour lines (made with gdal_contour) listed in a tilemaker-style config.json
 corrie tile config.json contours.pmtiles
 
-# Many countries: one archive per country folder, reused while unchanged, merged into one file
-corrie tile config.json world.pmtiles --shards groups/
+# Many regions: one archive per region folder, reused while unchanged, merged into one file
+corrie tile world.json world.pmtiles --shards groups/
 
-# Pack a country's contour lines into one compact .cpk
-corrie pack contours/cz/*.fgb -o contours/cz/cz.cpk
+# Pack a region's contour lines into one compact .cpk
+corrie pack contours/west/*.fgb -o contours/west/west.cpk
 
 # Do two builds hold the same lines in every tile?
 corrie compare old.pmtiles new.pmtiles
 
-# Neighbouring countries' lines in one file for QGIS
-corrie unpack border.gpkg contours/cz/cz.cpk contours/at/at.cpk
+# Neighbouring regions' lines in one file for QGIS
+corrie unpack border.gpkg contours/west/west.cpk contours/east/east.cpk
 ```
 
 To look at a result, drop the `.pmtiles` file on [pmtiles.io](https://pmtiles.io), or style it with MapLibre (see [Using with MapLibre GL](#using-with-maplibre-gl)).
@@ -137,39 +140,62 @@ gdal_contour -a elevation -i 10 dem-4326.tif contours.fgb
 corrie tile config.json contours.pmtiles
 ```
 
-### Many countries, one file
+### Many regions, one file
 
-Put each country's (or region's) lines in its own folder, pack each into one file, and list every pack in the config, all writing to one layer:
+Put each region's (or country's) lines in its own folder, pack each into one file, and list every pack in a config, all writing to one layer:
 
-```sh
-corrie pack contours/east/*.fgb -o contours/east/east.cpk
+```bash
+mkdir -p contours/west contours/east
+gdal_contour -a elevation -i 10 west.tif contours/west/lines.fgb
+gdal_contour -a elevation -i 10 east.tif contours/east/lines.fgb
 corrie pack contours/west/*.fgb -o contours/west/west.cpk
+corrie pack contours/east/*.fgb -o contours/east/east.cpk
 corrie tile world.json world.pmtiles --shards groups/
 ```
 
-`world.json` has the same `settings` as above, and one layer per region:
+`world.json`:
 
 ```json
-"layers": {
-  "east": { "minzoom": 11, "maxzoom": 14, "source": "contours/east/east.cpk", "write_to": "contour",
-            "simplify_below": 14, "simplify_level": 0.00005, "simplify_ratio": 2 },
-  "west": { "minzoom": 11, "maxzoom": 14, "source": "contours/west/west.cpk", "write_to": "contour",
-            "simplify_below": 14, "simplify_level": 0.00005, "simplify_ratio": 2 }
+{
+  "settings": { "minzoom": 11, "maxzoom": 14, "bounding_box": [-180, -85, 180, 85] },
+  "layers": {
+    "east": { "minzoom": 11, "maxzoom": 14, "source": "contours/east/east.cpk", "write_to": "contour",
+              "simplify_below": 14, "simplify_level": 0.00005, "simplify_ratio": 2 },
+    "west": { "minzoom": 11, "maxzoom": 14, "source": "contours/west/west.cpk", "write_to": "contour",
+              "simplify_below": 14, "simplify_level": 0.00005, "simplify_ratio": 2 }
+  }
 }
+```
+
+The `tile` run (progress lines left out):
+
+```
+2 groups in "groups/"
+[1/2] east  building from 1 source
+[1/2] east  built: 68076 features, 4336 tiles in 0.3s
+[2/2] west  building from 1 source
+[2/2] west  built: 75384 features, 4199 tiles in 0.3s
+Merging 2 group archives into "world.pmtiles" ...
+Merged: 8404 tiles, 131 joined from several groups, in 0.1s
+Done in 0.7s: 2 groups (2 built, 0 reused), 8404 tiles
+```
+
+When a region's lines change, pack it again and run the same `tile` command: only that region is tiled again, the others are reused, and everything is merged.
+
+```bash
+corrie pack contours/east/*.fgb -o contours/east/east.cpk --force
+corrie tile world.json world.pmtiles --shards groups/
 ```
 
 ```
 2 groups in "groups/"
 [1/2] east  building from 1 source
-[1/2] east  built: 753 features, 175 tiles in 0.0s
-[2/2] west  building from 1 source
-[2/2] west  built: 951 features, 262 tiles in 0.0s
+[1/2] east  built: 68076 features, 4336 tiles in 0.3s
+[2/2] west  reused
 Merging 2 group archives into "world.pmtiles" ...
-Merged: 412 tiles, 25 joined from several groups, in 0.0s
-Done in 0.1s: 2 groups (2 built, 0 reused), 412 tiles
+Merged: 8404 tiles, 131 joined from several groups, in 0.1s
+Done in 0.4s: 2 groups (1 built, 1 reused), 8404 tiles
 ```
-
-When a region's lines change, pack it again and run the same `tile` command: only that region is tiled again, the others are reused, and everything is merged.
 
 ## Limitations
 
@@ -248,14 +274,14 @@ sources are all packs needs none.
   `.partial` file) behind; the next `corrie tile` run that uses a temp cache
   removes temp caches of processes that no longer run.
 
-Disk: a pack takes about **4.6 bytes per vertex** (a world-wide set of 42
-billion vertices: about 190 GB). Use `--shards` to keep the temp cache at
+Disk: a pack takes about **4.6 bytes per vertex** (a billion vertices:
+about 4.6 GB). Use `--shards` to keep the temp cache at
 the size of the largest group, or pack the sources once with `corrie pack`.
 
 ### Per-group builds (`--shards`)
 
 ```sh
-corrie tile config-contours.json contours.pmtiles --shards contours-groups/
+corrie tile world.json world.pmtiles --shards groups/
 ```
 
 The config's sources are grouped by folder: the first directory below the
@@ -280,15 +306,7 @@ For each group, in name order:
 Then all group archives are merged into `OUTPUT` (see `corrie merge`): tiles
 inside one group are copied as stored, tiles on group borders are joined.
 
-```
-181 groups in "contours-groups"
-[  1/181] ae        reused
-...
-[ 48/181] cz        building from 5 sources
-[ 48/181] cz        built: 2383086 features, 43211 tiles in 51.2s
-...
-Merging 181 group archives into "contours.pmtiles" ...
-```
+See [Many regions, one file](#many-regions-one-file) for a run.
 
 The output holds the same tiles and lines as a single run over all sources
 (`corrie compare` reports them identical; line order inside a tile can
@@ -428,7 +446,7 @@ is kept unless `--force` is given; packs are written as `.partial` and renamed
 when complete. The run ends with the sizes:
 
 ```
-17 packs: 8.39 GB of sources -> 2.31 GB of packs (3.6x smaller), 2.0s
+1 pack: 0.30 GB of sources -> 0.08 GB of packs (3.7x smaller), 0.3s
 ```
 
 ### Moving a config to packs
@@ -437,14 +455,22 @@ With `--config`, `pack` packs the sources of a tilemaker config and writes a
 copy of the config, `<config>-packs.json` (or `--out-config`, which may be
 the config itself), whose sources are the packs. Only the `source` strings
 change, so the copy keeps the config's layout and a diff shows just them.
-`--only cz,at` packs and switches only those groups (the folder names
-`--shards` uses), to move a few countries at a time:
+`--only east` packs and switches only that group (the folder names
+`--shards` uses), to move a few regions at a time. With `lines.json` being
+`world.json` with each region's `lines.fgb` as its source:
 
-```sh
-corrie pack --config config-contours.json --only cz,at
-diff config-contours.json config-contours-packs.json
-corrie tile config-contours-packs.json contours-packs.pmtiles --shards contours-groups/
-corrie compare contours.pmtiles contours-packs.pmtiles     # IDENTICAL when built by the same corrie
+```bash
+corrie pack --config lines.json --only east
+diff lines.json lines-packs.json
+corrie tile lines-packs.json lines-packs.pmtiles --shards groups-packs/
+corrie compare world.pmtiles lines-packs.pmtiles     # IDENTICAL
+```
+
+```
+4c4
+<     "east": { "minzoom": 11, "maxzoom": 14, "source": "contours/east/lines.fgb", "write_to": "contour",
+---
+>     "east": { "minzoom": 11, "maxzoom": 14, "source": "contours/east/lines.cpk", "write_to": "contour",
 ```
 
 Once a config reads a pack, its source files are no longer needed for
@@ -458,10 +484,10 @@ named after it. It turns a config of many files per country into one pack
 per country, for example after shapefile size limits forced a country into
 tiles:
 
-```sh
-corrie pack --config config-contours.json --per-group      # contours/cn/*.cpk -> contours/cn/cn.cpk, …
-corrie tile config-contours-packs.json contours-new.pmtiles --shards contours-groups/
-corrie compare contours.pmtiles contours-new.pmtiles       # IDENTICAL
+```bash
+corrie pack --config lines.json --per-group --out-config regions.json   # contours/east/*.fgb -> contours/east/east.cpk, …
+corrie tile regions.json regions.pmtiles --shards groups-regions/
+corrie compare world.pmtiles regions.pmtiles     # IDENTICAL
 ```
 
 A group's layers must agree on everything but their source; the rewritten
@@ -479,11 +505,11 @@ extension: `.fgb` (FlatGeobuf), `.gpkg`, `.geojson` or `.shp`. Each line has
 name) and `folder` (the pack's folder, for example its country), so a country
 and its neighbours can be checked in QGIS side by side, styled by `folder`:
 
-```sh
-corrie unpack border.fgb contours/xk/*.cpk contours/me/*.cpk --bbox 19.7,42.4,20.6,43.1
+```bash
+corrie unpack border.fgb contours/west/west.cpk contours/east/east.cpk --bbox 12.95,47,13.05,48
 ```
 
-With `--bbox`, only lines touching the box are written, each one whole.
+With `--bbox`, only lines touching the box are written, each one whole: here the lines along the regions' shared edge at 13°E.
 
 ## `corrie merge` — join contour archives
 
@@ -503,16 +529,22 @@ the same layer name, which the output keeps; an input listed twice is
 refused. The output's zoom range spans all inputs and its bounds are the
 union of theirs.
 
-The output is written as `OUTPUT.partial` and renamed when complete (see
-[Outputs](#outputs)), so it can be one of the inputs:
+```bash
+corrie merge both.pmtiles groups/west.pmtiles groups/east.pmtiles   # the same tiles as world.pmtiles
+```
 
-```sh
-corrie merge world.pmtiles world.pmtiles new-country.pmtiles
+The output is written as `OUTPUT.partial` and renamed when complete (see
+[Outputs](#outputs)), so it can be one of the inputs, for example to add a
+region to a file:
+
+```bash
+cp groups/west.pmtiles atlas.pmtiles
+corrie merge atlas.pmtiles atlas.pmtiles groups/east.pmtiles
 ```
 
 `merge` reads only corrie's contour schema; it is not a general PMTiles
 merger. It holds the directory entries of all inputs in memory, about 60
-bytes per tile (a world archive with 24 million tiles: about 1.5 GB).
+bytes per tile (25 million tiles: about 1.5 GB).
 
 ## `corrie compare` — same tiles, same lines?
 
@@ -525,25 +557,33 @@ lines compared per `(elevation, main, show)` group, ignoring line order.
 Exits 0 when the archives are identical (or, with `--tolerance`, when every
 difference is within it), 1 otherwise.
 
+Comparing the two regions with the west one alone:
+
+```bash
+corrie compare world.pmtiles groups/west.pmtiles --show 2
 ```
-tiles: a=23918844 b=109272 common=109272
-only in a: 23809572 11/688/151 11/689/151 11/690/150
+
+```
+tiles: a=8404 b=4199 common=4199
+only in a: 4205 11/1103/719 11/1102/719
 only in b: 0
-common tiles with different lines: 5479
-  a has every line of b, plus more: 5479
-    11/1152/702  points a=7598 b=1123
+common tiles with different lines: 131
+  a has every line of b, plus more: 131
+    11/1097/719  points a=13764 b=13101
+    11/1097/718  points a=14859 b=14117
+Error: archives differ
 ```
 
 A differing tile is reported as one of:
 
-- **a has every line of b, plus more** — e.g. comparing a world archive with
-  a build of a few countries: the world's border tiles also hold the
-  neighbours' lines.
+- **a has every line of b, plus more** — e.g. the 131 tiles above along the
+  regions' shared edge, which also hold the east's lines.
 - **b has every line of a, plus more** — the same, the other way round.
 - **lines changed** — neither contains the other: lines moved or differ.
 
 `--tolerance PX` compares archives whose lines are expected to move a
-little, for example builds by two corrie versions. Lines then count as the
+little, for example builds by two corrie versions
+(`corrie compare world.pmtiles regions.pmtiles --tolerance 8`). Lines then count as the
 same when every vertex inside the tile lies within `PX` tile pixels of the
 other side's lines, and the other way round. A tile is 4096 tile pixels and
 is drawn 512 screen pixels wide, so `--tolerance 8` is one screen pixel.
@@ -608,7 +648,7 @@ corrie build dem.tif out.pmtiles --min-z 10 --max-z 15 --levels "10:100,12:50,14
 corrie build dem.tif out.mbtiles --simplify 4.0
 
 # Multi-raster mosaic via VRT
-gdalbuildvrt merged.vrt tile1.tif tile2.tif tile3.tif
+gdalbuildvrt merged.vrt west.tif east.tif
 corrie build merged.vrt out.pmtiles
 ```
 
@@ -616,7 +656,7 @@ corrie build merged.vrt out.pmtiles
 
 ## Performance
 
-corrie uses all cores, reads only the parts of each line a tile needs (lines are indexed in 128-segment pieces), and with packs has no ingest step at all. Highlights, on contours of Madagascar, Kosovo, Montenegro, Réunion and the Comoros (17 files, 506 M vertices, 163,365 tiles at z11–14), Apple M-series laptop, 10 workers:
+corrie uses all cores, reads only the parts of each line a tile needs (lines are indexed in 128-segment pieces), and with packs has no ingest step at all. Highlights, on the contour lines of Madagascar, Kosovo, Montenegro, Réunion and the Comoros, made with `gdal_contour` every 10 m from the [JAXA ALOS AW3D30](https://www.eorc.jaxa.jp/ALOS/en/dataset/aw3d30/aw3d30_e.htm) DEM (30 m) and clipped to each country (17 shapefiles, 506 M vertices, 163,365 tiles at z11–14), on an Apple M-series laptop with 10 workers:
 
 | Run | Time | Peak RSS |
 |---|---|---|
