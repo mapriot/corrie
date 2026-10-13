@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.1 — 2026-10-13
+
+### Fixed
+
+- On Linux, GDAL ran on the SQLite built into corrie, which enforces foreign
+  keys, so `unpack` to a GeoPackage failed with GDAL 3.6 ("FOREIGN KEY
+  constraint failed"). corrie now links the system SQLite, the one GDAL
+  uses; building it needs SQLite's headers, which GDAL's development
+  packages bring.
+- `build` printed its input's bounds as "[11.9999W 47.0001S …]", which read
+  as west longitudes for a raster east of Greenwich.
+
+### Added
+
+- `examples/readme.sh` runs every example in the README on two Copernicus
+  GLO-30 DEM tiles, natively or with the Docker image; the README's examples
+  and outputs are those of that run.
+
 ## 0.5.0 — 2026-10-13
 
 ### Added

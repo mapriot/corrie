@@ -49,7 +49,7 @@ On macOS with Homebrew GDAL you may need `PKG_CONFIG_PATH="/opt/homebrew/lib/pkg
 
 ### GDAL prerequisites
 
-Native builds (crates.io / source) need GDAL on your system:
+Native builds (crates.io / source) need GDAL on your system (its development packages also bring SQLite, which corrie links for MBTiles):
 
 | Platform | Command |
 |---|---|
