@@ -1,0 +1,16 @@
+# Keep the build context small: never send data or build artifacts to the daemon.
+target/
+.git/
+
+# Elevation inputs, contour sources and tile outputs (can be many GB)
+*.tif
+*.vrt
+*.ovr
+*.shp
+*.shx
+*.dbf
+*.fgb
+*.gpkg
+*.cpk
+*.pmtiles
+*.mbtiles
