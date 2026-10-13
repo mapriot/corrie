@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.0 — unreleased
+
+### Added
+
+- `corrie pack ... -o PACK`: pack several sources into one pack, in the
+  order given. Sources can be packs: their lines are copied as stored, so
+  packing packs again is lossless.
+- `corrie pack --config ... --per-group`: one pack per group (the folders
+  `--shards` builds by) and a config copy with one layer per group, to turn
+  many files per country into one.
+- A Dockerfile, and an image published to GHCR on version tags.
+
+### Changed
+
+- README: what corrie is for, installation (Docker, Cargo, supported GDAL
+  versions), a quick start, and limitations.
+- Messages say "1 source", not "1 sources".
+
 ## 0.4.0 — 2026-10-07
 
 ### Added

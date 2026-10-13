@@ -139,21 +139,22 @@ file on it, or style it with MapLibre (see
 
 ### Many regions, one file
 
-Put each region's lines in its own folder, pack them once, and list every pack
-in the config, all writing to one layer:
+Put each region's lines in its own folder, pack each region into one file,
+and list every pack in the config, all writing to one layer:
 
 ```sh
-corrie pack contours/*/*.fgb          # contours/east/lines.fgb -> contours/east/lines.cpk, …
+corrie pack contours/east/*.fgb -o contours/east/east.cpk
+corrie pack contours/west/*.fgb -o contours/west/west.cpk
 corrie tile world.json world.pmtiles --shards groups/
 ```
 
-`world.json` has the same `settings` as above, and one layer per pack:
+`world.json` has the same `settings` as above, and one layer per region:
 
 ```json
 "layers": {
-  "east": { "minzoom": 11, "maxzoom": 14, "source": "contours/east/lines.cpk", "write_to": "contour",
+  "east": { "minzoom": 11, "maxzoom": 14, "source": "contours/east/east.cpk", "write_to": "contour",
             "simplify_below": 14, "simplify_level": 0.00005, "simplify_ratio": 2 },
-  "west": { "minzoom": 11, "maxzoom": 14, "source": "contours/west/lines.cpk", "write_to": "contour",
+  "west": { "minzoom": 11, "maxzoom": 14, "source": "contours/west/west.cpk", "write_to": "contour",
             "simplify_below": 14, "simplify_level": 0.00005, "simplify_ratio": 2 }
 }
 ```
@@ -161,16 +162,17 @@ corrie tile world.json world.pmtiles --shards groups/
 ```
 2 groups in "groups/"
 [1/2] east  building from 1 source
-[1/2] east  built: 753 features, 175 tiles in 0.1s
+[1/2] east  built: 753 features, 175 tiles in 0.0s
 [2/2] west  building from 1 source
-[2/2] west  built: 951 features, 262 tiles in 0.1s
+[2/2] west  built: 951 features, 262 tiles in 0.0s
 Merging 2 group archives into "world.pmtiles" ...
 Merged: 412 tiles, 25 joined from several groups, in 0.0s
-Done in 0.2s: 2 groups (2 built, 0 reused), 412 tiles
+Done in 0.1s: 2 groups (2 built, 0 reused), 412 tiles
 ```
 
-When a region's lines change, run the same command again: only that region is
-tiled again, the others are reused, and everything is merged.
+When a region's lines change, pack it again and run the same `tile` command:
+only that region is tiled again, the others are reused, and everything is
+merged.
 
 ## Commands
 
@@ -407,8 +409,8 @@ A minimal config is in the [Quick start](#from-contour-lines).
 ## `corrie pack` — compact contour sources
 
 ```sh
-corrie pack <SOURCE>... [--field elevation] [--drop-seams DEG] [--force] [-j N]
-corrie pack --config <CONFIG.json> [--only GROUPS] [--out-config FILE] [--drop-seams DEG] [--force] [-j N]
+corrie pack <SOURCE>... [-o PACK] [--field elevation] [--drop-seams DEG] [--force] [-j N]
+corrie pack --config <CONFIG.json> [--per-group] [--only GROUPS] [--out-config FILE] [--drop-seams DEG] [--force] [-j N]
 ```
 
 A pack (`.cpk`) holds one source's lines and their elevations, and nothing
@@ -431,10 +433,16 @@ source the pack was made from.
   traces such lines where one tile's data meets nodata. A feature with one
   vertex elsewhere is kept whole. The run reports how many were left out.
 
-Each source becomes `<name>.cpk` next to it. A pack that is up to date (made
-from the same path, size, modification time, elevation column and
-`--drop-seams`) is kept unless `--force` is given; packs are written as `.partial` and renamed when
-complete. The run ends with the sizes:
+Each source becomes `<name>.cpk` next to it, or with `-o PACK` all of them
+become one pack, in the order given: a region tiled in pieces (a mosaic of
+contour files) is best packed into one file. Sources can be packs too: their
+lines are copied as stored, so packing packs again loses nothing
+(`--drop-seams` applies to vector files only).
+
+A pack that is up to date (made from the same sources, in the same order,
+with the same sizes, modification times, elevation column and `--drop-seams`)
+is kept unless `--force` is given; packs are written as `.partial` and renamed
+when complete. The run ends with the sizes:
 
 ```
 17 packs: 8.39 GB of sources -> 2.31 GB of packs (3.6x smaller), 2.0s
@@ -458,6 +466,23 @@ corrie compare contours.pmtiles contours-packs.pmtiles     # IDENTICAL when buil
 
 Once a config reads a pack, its source files are no longer needed for
 tiling; with `--shards`, deleting them does not rebuild the group.
+
+### One pack per group
+
+`--per-group` packs each group's sources, files or packs, into one pack,
+`<folder>/<group>.cpk`, and writes a config copy with one layer per group,
+named after it. It turns a config of many files per country into one pack
+per country, for example after shapefile size limits forced a country into
+tiles:
+
+```sh
+corrie pack --config config-contours.json --per-group      # contours/cn/*.cpk -> contours/cn/cn.cpk, …
+corrie tile config-contours-packs.json contours-new.pmtiles --shards contours-groups/
+corrie compare contours.pmtiles contours-new.pmtiles       # IDENTICAL
+```
+
+A group's layers must agree on everything but their source; the rewritten
+layers name their output layer (`write_to`) explicitly.
 
 ## `corrie unpack` — packs to GIS files
 
