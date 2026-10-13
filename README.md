@@ -1,109 +1,113 @@
 # corrie
 
-Contour lines to vector tiles, fast: from a single DEM to a worldwide contour
-layer in one PMTiles file.
+Fast contour vector-tile generator from contour lines or elevation rasters.
 
-corrie turns contour lines into clustered [PMTiles](https://docs.protomaps.com/pmtiles/)
-vector tiles (typically z11–14), ready for [MapLibre GL JS](https://maplibre.org/),
-[Martin](https://martin.maplibre.org/) or any PMTiles server. It reads lines
-from any vector file GDAL opens (FlatGeobuf, GeoPackage, Shapefile, …) or from
-its own compact packs, takes the same `config.json` as
-[tilemaker](https://github.com/systemed/tilemaker) does for contours, and can
-also contour a DEM by itself. It was written for the worldwide contour layer
-of [MapRiot](https://mapriot.com), after a tilemaker pipeline could no longer
-build it.
+Turns contour lines — FlatGeobuf, GeoPackage, shapefiles, anything GDAL reads — or a DEM into clustered [PMTiles](https://docs.protomaps.com/pmtiles/) vector tiles, ready for [MapLibre GL](https://maplibre.org/), [Martin](https://martin.maplibre.org/) or any PMTiles server. Scales from a single raster to a worldwide contour layer in one file.
 
-## Why corrie
+Built as a fast Rust replacement for the [tilemaker](https://github.com/systemed/tilemaker) contour pipeline (`tilemaker → mbtiles → pmtiles convert`) — it reads the same `config.json`, uses all CPU cores via [rayon](https://github.com/rayon-rs/rayon), and keeps working where tilemaker runs out of memory and disk:
 
-- **World scale on one machine.** MapRiot's world layer (1,020 sources,
-  about 42 billion vertices) tiles into a single 118 GB PMTiles file with
-  24.5 million tiles in about 45 minutes, on one server with 10 worker
-  threads.
-- **Rebuild one country, not the world.** With `--shards`, every country
-  (folder of sources) is tiled into its own archive and reused while its
-  inputs are unchanged. Replacing a country re-tiles only that country, then
-  merges, which takes minutes. The merged file has exactly the lines one big
-  run would write.
-- **Compact inputs.** `corrie pack` stores contour lines in `.cpk` packs about
-  3.6× smaller than shapefiles (vertices move by under 1 cm), which are read in
-  place with no ingest step. MapRiot's 694 GB of shapefiles became 191 GB of
-  packs.
-- **Builds you can check.** `corrie compare` tells whether two archives hold
-  the same lines in every tile, exactly or within a number of pixels, so a new
-  build or a new source can be checked before it goes live.
-- **Safe for long runs.** The output is written beside the live file and
-  swapped in when complete, so a tile server keeps serving the old one;
-  Ctrl+C or a closed terminal cleans up after itself.
-- **Easy to inspect.** `corrie unpack` writes packs back out as GeoPackage,
-  FlatGeobuf, GeoJSON or Shapefile, for example neighbouring countries in one
-  file, to check in QGIS that their lines meet at the border.
+- **Builds per country, merges into one file.** `--shards` tiles each group of sources (a country folder) on its own, reuses every group whose inputs did not change, and merges them. Replacing one country re-tiles only that country.
+- **Compact inputs.** `corrie pack` stores contour lines in `.cpk` packs, about 3.6× smaller than shapefiles and read in place — no ingest step, no temp cache.
+- **Checkable.** `corrie compare` tells whether two builds hold the same lines in every tile, exactly or within N pixels.
+- **Safe for long runs.** The output is written beside the live file and swapped in when complete; Ctrl+C or a closed terminal cleans up after itself.
+- **Inspectable.** `corrie unpack` writes packs back out as GeoPackage, FlatGeobuf, GeoJSON or Shapefile for QGIS — neighbouring countries in one file, to check their lines meet at the border.
 
-## Install
+## Installation
 
-### Docker (no GDAL or Rust needed)
+Three ways to get corrie, easiest first.
 
-```sh
+### Docker — no GDAL or Rust needed
+
+Only Docker is required. Build the image once, then run it:
+
+```bash
 git clone https://github.com/mapriot/corrie && cd corrie
 docker build -t corrie .
-cd /path/to/your/data
-docker run --rm -v "$PWD:/data" corrie tile config.json contours.pmtiles
+docker run --rm -v "$PWD:/data" corrie tile /data/config.json /data/contours.pmtiles
 ```
 
-The current directory is mounted at `/data`, where relative paths, and the
-sources a config lists, are resolved.
+Bind-mount the directory holding your contour lines, rasters and config (and where output goes) at `/data`; paths are resolved inside the container, and a config's sources relative to the config.
 
-### With Cargo
+### From crates.io
 
-Needs Rust ([rustup](https://rustup.rs/)) and GDAL, see below.
+Needs GDAL installed — see [prerequisites](#gdal-prerequisites) below.
 
-```sh
-cargo install corrie                                    # from crates.io
-cargo install --git https://github.com/mapriot/corrie   # or the latest commit
+```bash
+cargo install corrie
 ```
 
-### GDAL
+### From source
 
-`pack`, `unpack` and `build`, and `tile` for sources that are not packs, use
-GDAL. Native builds need it installed:
+```bash
+git clone https://github.com/mapriot/corrie
+cd corrie
+cargo build --release   # binary at target/release/corrie
+```
+
+On macOS with Homebrew GDAL you may need `PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig" cargo build --release`.
+
+### GDAL prerequisites
+
+Native builds (crates.io / source) need GDAL on your system:
 
 | Platform | Command |
 |---|---|
 | macOS | `brew install gdal` |
 | Ubuntu / Debian | `sudo apt install libgdal-dev gdal-bin` |
 | Fedora / RHEL | `sudo dnf install gdal-devel` |
+| Windows | [OSGeo4W](https://trac.osgeo.org/osgeo4w/) or [Conda](https://anaconda.org/conda-forge/gdal) — ensure `gdal-config` is on your PATH *(untested)* |
 
-**Supported GDAL versions: 3.5–3.12**, the versions the `gdal` Rust crate
-(0.19) has bindings for. GDAL 3.13, which current Homebrew installs, does not
-build yet. Until a `gdal` release supports it, use Docker, install GDAL < 3.13
-(for example `conda install -c conda-forge 'gdal>=3.5,<3.13'`), or build
-against the crate's main branch:
+**Supported GDAL versions: 3.5–3.12** — the versions the `gdal` Rust crate ships bindings for. GDAL **3.13 and newer are not yet supported** and will fail to build. If your package manager installs 3.13+ (current Homebrew `gdal` does), install a supported build via conda-forge — `conda install -c conda-forge 'gdal>=3.5,<3.13'` — use Docker, or build against the `gdal` crate's main branch:
 
-```sh
+```bash
 git clone https://github.com/georust/gdal ../georust-gdal
 cargo install --path . \
   --config 'patch.crates-io.gdal.path="../georust-gdal"' \
   --config 'patch.crates-io.gdal-sys.path="../georust-gdal/gdal-sys"'
 ```
 
-## Quick start
+## Usage
 
-### From a DEM, in one command
+| Command | What it does |
+|---|---|
+| [`tile`](#corrie-tile--contour-lines-to-clustered-pmtiles) | Contour lines listed in a `config.json` → clustered PMTiles; `--shards` for per-country builds |
+| [`pack`](#corrie-pack--compact-contour-sources) | Vector files → compact `.cpk` packs that `tile` reads in place |
+| [`unpack`](#corrie-unpack--packs-to-gis-files) | Packs → GeoPackage, FlatGeobuf, GeoJSON or Shapefile, e.g. for QGIS |
+| [`merge`](#corrie-merge--join-contour-archives) | Join archives written by `tile` (e.g. one per country) into one |
+| [`compare`](#corrie-compare--same-tiles-same-lines) | Do two archives hold the same lines, tile by tile? |
+| [`build`](#corrie-build--dem-direct-contour-tiles) | A DEM → contour tiles directly (PMTiles or MBTiles) |
 
-```sh
+`corrie <command> --help` lists every option.
+
+### Quick start
+
+```bash
+# A DEM straight to contour tiles — 50 m lines from z11 down to 5 m at z14
 corrie build dem.tif contours.pmtiles
+
+# Contour lines (made with gdal_contour) listed in a tilemaker-style config.json
+corrie tile config.json contours.pmtiles
+
+# Many countries: one archive per country folder, reused while unchanged, merged into one file
+corrie tile config.json world.pmtiles --shards groups/
+
+# Pack a country's contour lines into one compact .cpk
+corrie pack contours/cz/*.fgb -o contours/cz/cz.cpk
+
+# Do two builds hold the same lines in every tile?
+corrie compare old.pmtiles new.pmtiles
+
+# Neighbouring countries' lines in one file for QGIS
+corrie unpack border.gpkg contours/cz/cz.cpk contours/at/at.cpk
 ```
 
-`build` contours the raster tile by tile (any format and CRS GDAL reads):
-50 m lines from z11, 20 m from z12, 10 m from z13 and 5 m at z14, all
-configurable (see [`corrie build`](#corrie-build--dem-direct-contour-tiles)).
-It suits one raster or a VRT mosaic. For large areas, built and updated region
-by region, contour with GDAL and use `tile`.
+To look at a result, drop the `.pmtiles` file on [pmtiles.io](https://pmtiles.io), or style it with MapLibre (see [Using with MapLibre GL](#using-with-maplibre-gl)).
+
+`build` contours one raster (or a VRT mosaic) tile by tile, any format and CRS GDAL reads, with configurable intervals (see [`corrie build`](#corrie-build--dem-direct-contour-tiles)). For large areas, built and updated country by country, contour with GDAL and use `tile`.
 
 ### From contour lines
 
-For bigger or curated data, make the lines with GDAL (and clip or filter them
-as you like), then tile them. The lines must be in WGS84 longitude/latitude,
-with the elevation in a column (`elevation` by default):
+Make the lines with GDAL (and clip or filter them as you like), then tile them. The lines must be in WGS84 longitude/latitude, with the elevation in a column (`elevation` by default):
 
 ```sh
 gdalwarp -t_srs EPSG:4326 dem.tif dem-4326.tif      # if the DEM is in another CRS
@@ -133,14 +137,9 @@ gdal_contour -a elevation -i 10 dem-4326.tif contours.fgb
 corrie tile config.json contours.pmtiles
 ```
 
-To look at the result, open [pmtiles.io](https://pmtiles.io) and drop the
-file on it, or style it with MapLibre (see
-[Using the output](#using-the-output-with-maplibre-gl-js)).
+### Many countries, one file
 
-### Many regions, one file
-
-Put each region's lines in its own folder, pack each region into one file,
-and list every pack in the config, all writing to one layer:
+Put each country's (or region's) lines in its own folder, pack each into one file, and list every pack in the config, all writing to one layer:
 
 ```sh
 corrie pack contours/east/*.fgb -o contours/east/east.cpk
@@ -170,28 +169,13 @@ Merged: 412 tiles, 25 joined from several groups, in 0.0s
 Done in 0.1s: 2 groups (2 built, 0 reused), 412 tiles
 ```
 
-When a region's lines change, pack it again and run the same `tile` command:
-only that region is tiled again, the others are reused, and everything is
-merged.
-
-## Commands
-
-| Command | What it does |
-|---|---|
-| [`tile`](#corrie-tile--contour-lines-to-clustered-pmtiles) | Contour lines listed in a `config.json` → clustered PMTiles; `--shards` for per-region builds |
-| [`pack`](#corrie-pack--compact-contour-sources) | Vector files → compact `.cpk` packs that `tile` reads in place |
-| [`unpack`](#corrie-unpack--packs-to-gis-files) | Packs → GeoPackage, FlatGeobuf, GeoJSON or Shapefile, e.g. for QGIS |
-| [`merge`](#corrie-merge--join-contour-archives) | Join archives written by `tile` (e.g. one per country) into one |
-| [`compare`](#corrie-compare--same-tiles-same-lines) | Do two archives hold the same lines, tile by tile? |
-| [`build`](#corrie-build--dem-direct-contour-tiles) | A DEM → contour tiles directly (PMTiles or MBTiles) |
-
-`corrie <command> --help` lists every option.
+When a region's lines change, pack it again and run the same `tile` command: only that region is tiled again, the others are reused, and everything is merged.
 
 ## Limitations
 
 - **Fixed attributes.** `tile` writes one MVT layer whose lines carry
-  `elevation`, `main` and `show`, with MapRiot's zoom rules for 100, 50, 20,
-  10 and 5 m lines (see [Attribute derivation](#attribute-derivation-compiled-in)).
+  `elevation`, `main` and `show`, with fixed zoom rules for 100, 50, 20, 10
+  and 5 m lines (see [Attribute derivation](#attribute-derivation-compiled-in)).
   Other rules mean changing `src/attribute_rules.rs`. `build` has options for
   its intervals and `main`/`show`.
 - **WGS84 input.** Lines for `tile` and `pack` must be in longitude/latitude
@@ -373,8 +357,7 @@ tolerance.
 ### Attribute derivation (compiled in)
 
 Each contour line is tagged with `elevation`, plus `main` and `show`
-booleans, based on its elevation in metres. The rules are hard-coded (they
-are those of MapRiot's contour style):
+booleans, based on its elevation in metres. The rules are hard-coded:
 
 | Elevation | `minzoom` | `main` | `show` |
 |---|---|---|---|
@@ -631,26 +614,17 @@ corrie build merged.vrt out.pmtiles
 
 ---
 
-## Performance, memory and disk
+## Performance
 
-**The world.** MapRiot's worldwide layer: 1,020 sources, about 42 billion
-vertices in 191 GB of packs, tiled with `--shards` into one 118 GB PMTiles
-file of 24.5 million tiles (z11–14). On one x86-64 server with 10 worker
-threads, a full build from packs takes about 43 minutes, the merge of the
-country archives included (about 66 minutes from shapefiles, which are packed
-on the way). A run where no country changed only merges: about 6 minutes.
-
-**A laptop benchmark.** Madagascar, Kosovo, Montenegro, Réunion and the Comoros
-(17 sources, 506 M vertices, 163,365 tiles), Apple M-series laptop, 10
-workers, files in the page cache:
+corrie uses all cores, reads only the parts of each line a tile needs (lines are indexed in 128-segment pieces), and with packs has no ingest step at all. Highlights, on contours of Madagascar, Kosovo, Montenegro, Réunion and the Comoros (17 files, 506 M vertices, 163,365 tiles at z11–14), Apple M-series laptop, 10 workers:
 
 | Run | Time | Peak RSS |
 |---|---|---|
 | `tile` from the shapefiles (packing them takes 2.7 s of it) | 10.9 s | 2.7 GB |
-| `tile` from packs | 7.9 s | 2.6 GB |
-| `pack` of the 17 shapefiles | 2.2 s | 0.6 GB |
+| `tile` from packs | **7.9 s** | 2.6 GB |
+| `pack` of the 17 shapefiles (8.4 GB → 2.3 GB) | 2.2 s | 0.6 GB |
 
-Both `tile` runs write byte-identical archives.
+Both `tile` runs write byte-identical archives. Whole continents are tiled the same way with `--shards`, one country at a time.
 
 - **RAM:** packs are memory-mapped, so the peak RSS above is mostly packs
   in the page cache, which the kernel can drop under pressure. Besides
@@ -666,7 +640,7 @@ suitable for direct serving without re-clustering.
 
 ---
 
-## Using the output with MapLibre GL JS
+## Using with MapLibre GL
 
 PMTiles output includes `vector_layers` metadata, so MapLibre can introspect
 the source. Serve the file with Martin or another PMTiles server, or read it
