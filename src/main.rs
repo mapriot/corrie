@@ -514,7 +514,7 @@ fn run_pack(args: PackArgs) -> anyhow::Result<()> {
     let todo: Vec<_> = all.iter().filter(|(src, field, out)| args.force || !is_current(out, src, field, &opts)).cloned().collect();
     let t0 = std::time::Instant::now();
     if !todo.is_empty() {
-        corrie::log!("Packing {} sources ({} already up to date) ...", todo.len(), all.len() - todo.len());
+        corrie::log!("Packing {} ({} already up to date) ...", corrie::count(todo.len() as u64, "source"), all.len() - todo.len());
         let seams = pack_files(&todo, &opts)?;
         if opts.drop_seams.is_some() {
             corrie::log!("Left out {} lines along degree seams", seams);
@@ -527,8 +527,8 @@ fn run_pack(args: PackArgs) -> anyhow::Result<()> {
         } else { size(src) }
     }).sum();
     let pack_bytes: u64 = all.iter().map(|(_, _, out)| size(out)).sum();
-    corrie::log!("{} packs: {:.2} GB of sources -> {:.2} GB of packs ({:.1}x smaller), {:.1}s",
-        all.len(), source_bytes as f64 / 1e9, pack_bytes as f64 / 1e9,
+    corrie::log!("{}: {:.2} GB of sources -> {:.2} GB of packs ({:.1}x smaller), {:.1}s",
+        corrie::count(all.len() as u64, "pack"), source_bytes as f64 / 1e9, pack_bytes as f64 / 1e9,
         source_bytes as f64 / pack_bytes.max(1) as f64, t0.elapsed().as_secs_f64());
 
     if let Some(cfg) = &args.config {
@@ -541,7 +541,7 @@ fn run_pack(args: PackArgs) -> anyhow::Result<()> {
         let o = corrie::cleanup::PartialOutput::new(&out)?;
         std::fs::write(o.path(), text).with_context(|| format!("write {:?}", o.path()))?;
         o.commit()?;
-        corrie::log!("Wrote {:?}: {} sources now read their packs", out, switched.len());
+        corrie::log!("Wrote {:?}: {} switched to packs", out, corrie::count(switched.len() as u64, "source"));
     }
     Ok(())
 }

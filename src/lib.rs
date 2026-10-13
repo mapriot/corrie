@@ -12,6 +12,12 @@ macro_rules! log {
     }};
 }
 
+/// `n` and the word, plural unless `n` is 1: "1 source", "3 sources".
+pub fn count(n: impl Into<u64>, word: &str) -> String {
+    let n = n.into();
+    if n == 1 { format!("1 {word}") } else { format!("{n} {word}s") }
+}
+
 pub mod attribute_rules;
 pub mod build;
 pub mod cleanup;

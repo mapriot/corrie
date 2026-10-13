@@ -165,7 +165,7 @@ pub fn build(
     std::fs::create_dir_all(shard_dir).with_context(|| format!("create {:?}", shard_dir))?;
     let groups = group_sources(sources)?;
     let width = groups.iter().map(|g| g.name.len()).max().unwrap_or(0);
-    crate::log!("{} groups in {:?}", groups.len(), shard_dir);
+    crate::log!("{} in {:?}", crate::count(groups.len() as u64, "group"), shard_dir);
 
     let (mut built, mut reused) = (0, 0);
     let mut paths = Vec::with_capacity(groups.len());
@@ -179,7 +179,7 @@ pub fn build(
             paths.push(path);
             continue;
         }
-        crate::log!("{label}  building from {} sources", g.sources.len());
+        crate::log!("{label}  building from {}", crate::count(g.sources.len() as u64, "source"));
         let t0 = Instant::now();
         // tile_sources writes <group>.pmtiles.partial and renames it when
         // complete, so an archive at the final path is always whole.

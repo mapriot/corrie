@@ -124,7 +124,7 @@ fn moving_groups_to_packs_keeps_the_tiles() {
 
     // pack group b only: the copy differs from the config in b's source alone
     let packed = corrie(&["pack", "--config", &p("config.json"), "--only", "b"]);
-    assert!(log(&packed).contains("1 sources now read their packs"), "{}", log(&packed));
+    assert!(log(&packed).contains("1 source switched to packs"), "{}", log(&packed));
     assert!(d.join("b/tiny.cpk").exists() && !d.join("a/tiny.cpk").exists());
     let (orig, copy) = (std::fs::read_to_string(p("config.json")).unwrap(), std::fs::read_to_string(p("config-packs.json")).unwrap());
     let changed: Vec<(&str, &str)> = orig.lines().zip(copy.lines()).filter(|(x, y)| x != y).collect();
@@ -151,7 +151,7 @@ fn moving_groups_to_packs_keeps_the_tiles() {
 
     // the rest, written over the packs config itself
     let rest = corrie(&["pack", "--config", &p("config-packs.json"), "--out-config", &p("config-packs.json")]);
-    assert!(log(&rest).contains("1 sources now read their packs"), "{}", log(&rest));
+    assert!(log(&rest).contains("1 source switched to packs"), "{}", log(&rest));
     let all = std::fs::read_to_string(p("config-packs.json")).unwrap();
     assert!(all.contains("a/tiny.cpk") && all.contains("b/tiny.cpk") && !all.contains(".shp"), "{all}");
     let packs = corrie(&["tile", &p("config-packs.json"), &p("packs.pmtiles"), "--shards", &p("groups")]);

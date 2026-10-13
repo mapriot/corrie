@@ -154,13 +154,13 @@ pub fn packs_for(sources: &[SourceLayer], cache_dir: &Path, reuse: bool) -> Resu
         .collect();
 
     if !todo.is_empty() {
-        crate::log!("Packing {} of {} sources into {:?} ...", todo.len(), sources.len(), cache_dir);
+        crate::log!("Packing {} of {} into {:?} ...", todo.len(), crate::count(sources.len() as u64, "source"), cache_dir);
         let t0 = std::time::Instant::now();
         let jobs: Vec<(PathBuf, String, PathBuf)> = todo.iter()
             .map(|&i| (sources[i].shp_path.clone(), field(&sources[i]), paths[i].clone()))
             .collect();
         pack_files(&jobs, &PackOptions::default())?;
-        crate::log!("Packed {} sources in {:.1}s", todo.len(), t0.elapsed().as_secs_f64());
+        crate::log!("Packed {} in {:.1}s", crate::count(todo.len() as u64, "source"), t0.elapsed().as_secs_f64());
     } else if sources.iter().any(|s| !is_pack(&s.shp_path)) {
         crate::log!("Using the packs in {:?}", cache_dir);
     }
